@@ -444,6 +444,36 @@ LOGS_DIR = Path(__file__).parent.parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
 
+def cleanup_session_locks():
+    """
+    Delete WAL/SHM journal files and checkpoint sessions before startup.
+    This prevents "database is locked" errors from stale lock files.
+    """
+    cleaned = 0
+    for session_file in SESSIONS_DIR.glob('*.session'):
+        # Delete WAL and SHM files
+        for ext in ['-wal', '-shm']:
+            journal = Path(str(session_file) + ext)
+            if journal.exists():
+                try:
+                    journal.unlink()
+                    logger.info(f"🗑️ Deleted {journal.name}")
+                    cleaned += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not delete {journal.name}: {e}")
+
+        # Checkpoint main session to merge WAL data
+        try:
+            conn = sqlite3.connect(str(session_file), timeout=2)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception as e:
+            logger.debug(f"Could not checkpoint {session_file.name}: {e}")
+
+    if cleaned > 0:
+        logger.info(f"✅ Cleaned up {cleaned} session journal files")
+
+
 # ============================================================================
 # UTILITY FUNCTIONS (previously in matrix.py)
 # ============================================================================
@@ -6993,6 +7023,13 @@ if __name__ == '__main__':
         logger.info("✅ Inbox tables ready")
     except Exception as e:
         logger.warning(f"⚠️  Could not initialize inbox tables: {str(e)}")
+
+    # ========================================================================
+    # Clean up stale session lock files BEFORE any Telegram connections
+    # This prevents "database is locked" errors from previous server instances
+    # ========================================================================
+    logger.info("🧹 Cleaning up session lock files...")
+    cleanup_session_locks()
 
     # ========================================================================
     # Initialize GlobalConnectionManager FIRST (shared TelegramClient pool)

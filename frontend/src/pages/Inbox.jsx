@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAccounts } from '../context/AccountContext';
 import { useInbox } from '../hooks/useInbox';
-import { connectInbox, disconnectInbox, getInboxConnectionStatus } from '../services/api';
+import { getInboxConnectionStatus, connectInbox } from '../services/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -176,8 +176,9 @@ function Inbox({ isConnected }) {
   const [messageInput, setMessageInput] = useState('');
   const [sending, setSending] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState({});
-  const [connecting, setConnecting] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [connectAttempted, setConnectAttempted] = useState({});
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -217,38 +218,14 @@ function Inbox({ isConnected }) {
     }
   }, [accounts, selectedPhone]);
 
-  // Auto-connect when phone is selected and not connected
-  useEffect(() => {
-    const autoConnect = async () => {
-      if (selectedPhone && connectionStatus[selectedPhone] && !connectionStatus[selectedPhone].connected) {
-        // Check if inbox manager is running before attempting to connect
-        try {
-          const response = await getInboxConnectionStatus();
-          if (response.data?.inbox_manager_running && !response.data?.connections?.[selectedPhone]?.connected) {
-            console.log(`Auto-connecting inbox for ${selectedPhone}...`);
-            await connectInbox(selectedPhone);
-            // Refresh status after connection attempt
-            const updatedStatus = await getInboxConnectionStatus();
-            if (updatedStatus.data?.success) {
-              setConnectionStatus(updatedStatus.data.connections || {});
-            }
-          }
-        } catch (err) {
-          console.error('Auto-connect failed:', err);
-        }
-      }
-    };
-    
-    autoConnect();
-  }, [selectedPhone, connectionStatus]);
-
   // Fetch conversations when phone changes
+  // Fetch even if not connected - conversations are stored in database
   useEffect(() => {
-    if (selectedPhone && inboxConnected) {
+    if (selectedPhone) {
       fetchConversations();
       fetchRateLimitStatus();
     }
-  }, [selectedPhone, inboxConnected, fetchConversations, fetchRateLimitStatus]);
+  }, [selectedPhone, fetchConversations, fetchRateLimitStatus]);
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -280,36 +257,55 @@ function Inbox({ isConnected }) {
     return () => clearInterval(interval);
   }, []);
 
+  // Auto-connect when account is selected but not connected
+  useEffect(() => {
+    const autoConnect = async () => {
+      if (!selectedPhone) return;
+
+      // Check if already connected
+      const isConnected = connectionStatus[selectedPhone]?.connected;
+      if (isConnected) return;
+
+      // Don't retry if we already attempted for this phone
+      if (connectAttempted[selectedPhone]) return;
+
+      // Mark as attempted to prevent infinite retries
+      setConnectAttempted(prev => ({ ...prev, [selectedPhone]: true }));
+      setIsConnecting(true);
+
+      try {
+        console.log('Auto-connecting account:', selectedPhone);
+        const response = await connectInbox(selectedPhone);
+
+        if (response.data?.success) {
+          console.log('Connected successfully, syncing dialogs...');
+          // Refresh connection status
+          const statusResponse = await getInboxConnectionStatus();
+          if (statusResponse.data?.success) {
+            setConnectionStatus(statusResponse.data.connections || {});
+          }
+          // Sync dialogs and fetch conversations
+          await triggerSync();
+          await fetchConversations();
+        } else {
+          console.error('Failed to connect:', response.data?.message);
+        }
+      } catch (err) {
+        console.error('Auto-connect failed:', err);
+      } finally {
+        setIsConnecting(false);
+      }
+    };
+
+    // Small delay to let connection status load first
+    const timer = setTimeout(autoConnect, 500);
+    return () => clearTimeout(timer);
+  }, [selectedPhone, connectionStatus, connectAttempted, triggerSync, fetchConversations]);
+
   // Handle account selection
   const handleAccountSelect = (phone) => {
     setSelectedPhone(phone);
     clearSelection();
-  };
-
-  // Handle connect/disconnect
-  const handleConnect = async () => {
-    if (!selectedPhone) return;
-
-    setConnecting(true);
-    try {
-      const isCurrentlyConnected = connectionStatus[selectedPhone]?.connected;
-
-      if (isCurrentlyConnected) {
-        await disconnectInbox(selectedPhone);
-      } else {
-        await connectInbox(selectedPhone);
-      }
-
-      // Refresh status
-      const response = await getInboxConnectionStatus();
-      if (response.data?.success) {
-        setConnectionStatus(response.data.connections || {});
-      }
-    } catch (err) {
-      console.error('Connection error:', err);
-    } finally {
-      setConnecting(false);
-    }
   };
 
   // Handle send message
@@ -357,8 +353,13 @@ function Inbox({ isConnected }) {
           <MessageCircle className="w-6 h-6 text-primary" />
           <h1 className="text-2xl font-bold">Inbox</h1>
           {selectedPhone && (
-            <Badge variant={isAccountConnected ? 'default' : 'secondary'}>
-              {isAccountConnected ? (
+            <Badge variant={isAccountConnected ? 'default' : isConnecting ? 'outline' : 'secondary'}>
+              {isConnecting ? (
+                <>
+                  <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                  Connecting...
+                </>
+              ) : isAccountConnected ? (
                 <>
                   <Wifi className="w-3 h-3 mr-1" />
                   Connected
@@ -392,23 +393,9 @@ function Inbox({ isConnected }) {
           <Button
             variant="outline"
             size="sm"
-            onClick={handleConnect}
-            disabled={!selectedPhone || connecting}
-          >
-            {connecting ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : isAccountConnected ? (
-              <WifiOff className="w-4 h-4" />
-            ) : (
-              <Wifi className="w-4 h-4" />
-            )}
-          </Button>
-
-          <Button
-            variant="outline"
-            size="sm"
             onClick={handleSync}
             disabled={!selectedPhone || !isAccountConnected}
+            title="Sync dialogs"
           >
             <RefreshCw className="w-4 h-4" />
           </Button>
@@ -439,19 +426,11 @@ function Inbox({ isConnected }) {
                 <Users className="w-12 h-12 mb-4" />
                 <p>Select an account to view conversations</p>
               </div>
-            ) : !isAccountConnected ? (
+            ) : isConnecting ? (
               <div className="flex flex-col items-center justify-center h-full p-4 text-center text-muted-foreground">
-                <WifiOff className="w-12 h-12 mb-4" />
-                <p>Account not connected</p>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="mt-2"
-                  onClick={handleConnect}
-                  disabled={connecting}
-                >
-                  Connect
-                </Button>
+                <Loader2 className="w-12 h-12 mb-4 animate-spin text-primary" />
+                <p>Connecting to Telegram...</p>
+                <p className="text-sm mt-2">Syncing dialogs</p>
               </div>
             ) : loading ? (
               <div className="flex items-center justify-center h-full">

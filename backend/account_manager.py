@@ -1609,45 +1609,68 @@ def inbox_update_connection_state(account_phone: str, is_connected: bool,
     Returns:
         True if updated
     """
-    try:
-        clean_phone = normalize_phone(account_phone)
-        conn = get_db_connection()
-        cursor = conn.cursor()
+    import time
+    clean_phone = normalize_phone(account_phone)
+    max_retries = 5
+    retry_delay = 0.1  # Start with 100ms
 
-        # Upsert
-        cursor.execute('''
-            INSERT INTO inbox_connection_state (account_phone, is_connected, connected_at, updated_at)
-            VALUES (?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END, CURRENT_TIMESTAMP)
-            ON CONFLICT(account_phone) DO UPDATE SET
-                is_connected = excluded.is_connected,
-                connected_at = CASE WHEN excluded.is_connected AND NOT is_connected THEN CURRENT_TIMESTAMP ELSE connected_at END,
-                last_disconnect_at = CASE WHEN NOT excluded.is_connected AND is_connected THEN CURRENT_TIMESTAMP ELSE last_disconnect_at END,
-                reconnect_attempts = CASE WHEN excluded.is_connected THEN 0 ELSE reconnect_attempts END,
-                updated_at = CURRENT_TIMESTAMP
-        ''', (clean_phone, is_connected, is_connected))
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
 
-        # Apply extra fields if provided
-        if extra_fields:
-            set_parts = []
-            values = []
-            for key, value in extra_fields.items():
-                set_parts.append(f"{key} = ?")
-                values.append(value)
-            values.append(clean_phone)
+            # Upsert
+            cursor.execute('''
+                INSERT INTO inbox_connection_state (account_phone, is_connected, connected_at, updated_at)
+                VALUES (?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END, CURRENT_TIMESTAMP)
+                ON CONFLICT(account_phone) DO UPDATE SET
+                    is_connected = excluded.is_connected,
+                    connected_at = CASE WHEN excluded.is_connected AND NOT is_connected THEN CURRENT_TIMESTAMP ELSE connected_at END,
+                    last_disconnect_at = CASE WHEN NOT excluded.is_connected AND is_connected THEN CURRENT_TIMESTAMP ELSE last_disconnect_at END,
+                    reconnect_attempts = CASE WHEN excluded.is_connected THEN 0 ELSE reconnect_attempts END,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (clean_phone, is_connected, is_connected))
 
-            cursor.execute(f'''
-                UPDATE inbox_connection_state
-                SET {", ".join(set_parts)}, updated_at = CURRENT_TIMESTAMP
-                WHERE account_phone = ?
-            ''', values)
+            # Apply extra fields if provided
+            if extra_fields:
+                set_parts = []
+                values = []
+                for key, value in extra_fields.items():
+                    set_parts.append(f"{key} = ?")
+                    values.append(value)
+                values.append(clean_phone)
 
-        conn.commit()
-        conn.close()
-        return True
+                cursor.execute(f'''
+                    UPDATE inbox_connection_state
+                    SET {", ".join(set_parts)}, updated_at = CURRENT_TIMESTAMP
+                    WHERE account_phone = ?
+                ''', values)
 
-    except Exception as e:
-        logger.error(f"❌ Error updating connection state: {str(e)}")
-        return False
+            conn.commit()
+            return True
+
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                logger.warning(f"⚠️ Database locked, retrying ({attempt + 1}/{max_retries})...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+                continue
+            logger.error(f"❌ Error updating connection state: {str(e)}")
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ Error updating connection state: {str(e)}")
+            return False
+
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+    return False
 
 
 def inbox_get_connection_states() -> List[Dict]:

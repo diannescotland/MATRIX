@@ -31,6 +31,9 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 
+import sqlite3
+import time
+
 from telethon import TelegramClient, events
 from telethon.tl.types import User
 from telethon.errors import (
@@ -213,102 +216,132 @@ class GlobalConnectionManager:
         # Parse proxy
         proxy_tuple = self._parse_proxy(proxy) if isinstance(proxy, str) else proxy
 
-        async with self._get_lock(clean_phone):
-            try:
-                logger.info(f"Connecting account {clean_phone}...")
+        # Retry logic for database locks
+        max_retries = 5
+        retry_delay = 0.5  # Start with 500ms
 
-                # Create client
-                client = TelegramClient(
-                    session_path.replace('.session', ''),
-                    api_id,
-                    api_hash,
-                    proxy=proxy_tuple,
-                    timeout=30
-                )
+        for attempt in range(max_retries):
+            async with self._get_lock(clean_phone):
+                try:
+                    logger.info(f"Connecting account {clean_phone}..." + (f" (attempt {attempt + 1})" if attempt > 0 else ""))
 
-                # Connect
-                await client.connect()
+                    # Create client
+                    client = TelegramClient(
+                        session_path.replace('.session', ''),
+                        api_id,
+                        api_hash,
+                        proxy=proxy_tuple,
+                        timeout=30
+                    )
 
-                # Check if authorized
-                if not await client.is_user_authorized():
-                    logger.warning(f"Account {clean_phone} not authorized - needs authentication")
-                    await client.disconnect()
+                    # Connect
+                    await client.connect()
+
+                    # Check if authorized
+                    if not await client.is_user_authorized():
+                        logger.warning(f"Account {clean_phone} not authorized - needs authentication")
+                        await client.disconnect()
+                        return None
+
+                    # Get user info
+                    me = await client.get_me()
+
+                    # Register event handlers if requested and processor is set
+                    if register_events and self._event_processor:
+                        await self._register_event_handlers(client, clean_phone)
+
+                    # Store connection info
+                    self._clients[clean_phone] = ConnectionInfo(
+                        phone=clean_phone,
+                        client=client,
+                        connected_at=datetime.now(),
+                        my_id=me.id,
+                        my_name=me.first_name or "",
+                        api_id=api_id,
+                        api_hash=api_hash,
+                        session_path=session_path,
+                        proxy=proxy,
+                        event_handlers_registered=register_events and self._event_processor is not None
+                    )
+
+                    # Emit WebSocket event if socketio is available
+                    if self._socketio:
+                        self._socketio.emit('inbox:connection_status', {
+                            'account_phone': clean_phone,
+                            'connected': True,
+                            'event': 'connected',
+                            'timestamp': datetime.now().isoformat()
+                        })
+
+                    logger.info(f"Account {clean_phone} connected successfully")
+                    return client
+
+                except AuthKeyUnregisteredError:
+                    logger.error(f"Account {clean_phone} auth key invalid - needs re-authentication")
                     return None
 
-                # Get user info
-                me = await client.get_me()
+                except UserDeactivatedBanError:
+                    logger.error(f"Account {clean_phone} is banned/deactivated")
+                    return None
 
-                # Register event handlers if requested and processor is set
-                if register_events and self._event_processor:
-                    await self._register_event_handlers(client, clean_phone)
+                except Exception as e:
+                    error_str = str(e)
+                    if "database is locked" in error_str and attempt < max_retries - 1:
+                        logger.warning(f"⚠️ Session database locked for {clean_phone}, retrying in {retry_delay}s ({attempt + 1}/{max_retries})...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    logger.error(f"Failed to connect account {clean_phone}: {e}")
+                    return None
 
-                # Store connection info
-                self._clients[clean_phone] = ConnectionInfo(
-                    phone=clean_phone,
-                    client=client,
-                    connected_at=datetime.now(),
-                    my_id=me.id,
-                    my_name=me.first_name or "",
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    session_path=session_path,
-                    proxy=proxy,
-                    event_handlers_registered=register_events and self._event_processor is not None
-                )
-
-                # Emit WebSocket event if socketio is available
-                if self._socketio:
-                    self._socketio.emit('inbox:connection_status', {
-                        'account_phone': clean_phone,
-                        'connected': True,
-                        'event': 'connected',
-                        'timestamp': datetime.now().isoformat()
-                    })
-
-                logger.info(f"Account {clean_phone} connected successfully")
-                return client
-
-            except AuthKeyUnregisteredError:
-                logger.error(f"Account {clean_phone} auth key invalid - needs re-authentication")
-                return None
-
-            except UserDeactivatedBanError:
-                logger.error(f"Account {clean_phone} is banned/deactivated")
-                return None
-
-            except Exception as e:
-                logger.error(f"Failed to connect account {clean_phone}: {e}")
-                return None
+        logger.error(f"Failed to connect {clean_phone} after {max_retries} retries")
+        return None
 
     async def disconnect_account(self, phone: str) -> None:
-        """Gracefully disconnect account."""
+        """Gracefully disconnect account with retry logic for database locks."""
         clean_phone = self._normalize_phone(phone)
 
         if clean_phone not in self._clients:
             return
 
-        async with self._get_lock(clean_phone):
-            try:
-                conn_info = self._clients.get(clean_phone)
-                if conn_info and conn_info.client:
-                    if conn_info.client.is_connected():
-                        await conn_info.client.disconnect()
+        max_retries = 5
+        retry_delay = 0.3  # Start with 300ms
 
-                    del self._clients[clean_phone]
+        for attempt in range(max_retries):
+            async with self._get_lock(clean_phone):
+                try:
+                    conn_info = self._clients.get(clean_phone)
+                    if conn_info and conn_info.client:
+                        if conn_info.client.is_connected():
+                            await conn_info.client.disconnect()
 
-                # Emit WebSocket event
-                if self._socketio:
-                    self._socketio.emit('inbox:connection_status', {
-                        'account_phone': clean_phone,
-                        'connected': False,
-                        'event': 'disconnected',
-                        'timestamp': datetime.now().isoformat()
-                    })
+                        if clean_phone in self._clients:
+                            del self._clients[clean_phone]
 
-                logger.info(f"Account {clean_phone} disconnected")
+                    # Emit WebSocket event
+                    if self._socketio:
+                        self._socketio.emit('inbox:connection_status', {
+                            'account_phone': clean_phone,
+                            'connected': False,
+                            'event': 'disconnected',
+                            'timestamp': datetime.now().isoformat()
+                        })
 
-            except Exception as e:
-                logger.error(f"Error disconnecting {clean_phone}: {e}")
+                    logger.info(f"Account {clean_phone} disconnected")
+                    return  # Success, exit the retry loop
+
+                except Exception as e:
+                    error_str = str(e)
+                    if "database is locked" in error_str and attempt < max_retries - 1:
+                        logger.warning(f"⚠️ Database locked during disconnect for {clean_phone}, retrying in {retry_delay}s ({attempt + 1}/{max_retries})...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    logger.error(f"Error disconnecting {clean_phone}: {e}")
+                    # Still try to clean up
+                    if clean_phone in self._clients:
+                        del self._clients[clean_phone]
+                    return
 
     @asynccontextmanager
     async def with_client(self, phone: str, api_id: int = None, api_hash: str = None,

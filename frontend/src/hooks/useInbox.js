@@ -11,7 +11,13 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { io } from 'socket.io-client';
-import api from '../services/api';
+import {
+  getInboxConversations,
+  getInboxMessages,
+  sendInboxMessage,
+  getInboxRateLimitStatus,
+  triggerDialogSync
+} from '../services/api';
 
 const SOCKET_URL = 'http://localhost:5000';
 
@@ -235,7 +241,7 @@ export function useInbox(phone) {
       setError(null);
 
       try {
-        const response = await api.getInboxConversations(phone, options);
+        const response = await getInboxConversations(phone, options);
         if (response.data.success) {
           setConversations(response.data.conversations || []);
         } else {
@@ -260,7 +266,7 @@ export function useInbox(phone) {
       setError(null);
 
       try {
-        const response = await api.getInboxMessages(phone, peerId, options);
+        const response = await getInboxMessages(phone, peerId, options);
         if (response.data.success) {
           setMessages(response.data.messages || []);
           setSelectedPeer(peerId);
@@ -293,7 +299,7 @@ export function useInbox(phone) {
       if (!oldestMsgId) return;
 
       try {
-        const response = await api.getInboxMessages(phone, peerId, {
+        const response = await getInboxMessages(phone, peerId, {
           before_msg_id: oldestMsgId,
           limit: 50,
         });
@@ -314,7 +320,7 @@ export function useInbox(phone) {
       if (!phone || !peerId || !text.trim()) return null;
 
       try {
-        const response = await api.sendInboxMessage(phone, peerId, text, campaignId);
+        const response = await sendInboxMessage(phone, peerId, text, campaignId);
 
         if (response.data.success) {
           // Update rate limit status
@@ -340,7 +346,7 @@ export function useInbox(phone) {
     if (!phone) return;
 
     try {
-      const response = await api.getInboxRateLimitStatus(phone);
+      const response = await getInboxRateLimitStatus(phone);
       if (response.data.success) {
         setRateLimitStatus(response.data);
       }
@@ -354,7 +360,7 @@ export function useInbox(phone) {
     if (!phone) return null;
 
     try {
-      const response = await api.triggerDialogSync(phone);
+      const response = await triggerDialogSync(phone);
       return response.data;
     } catch (err) {
       console.error('Failed to trigger sync:', err);
