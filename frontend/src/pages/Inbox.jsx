@@ -208,14 +208,39 @@ function Inbox({ isConnected }) {
 
   // Set initial phone from selected accounts
   useEffect(() => {
-    if (!selectedPhone && selectedAccounts.length > 0) {
-      const phone = Object.keys(selectedAccounts[0] === true ? {} : selectedAccounts)[0] ||
-                    accounts.find(a => selectedAccounts.includes(a.phone))?.phone;
-      if (phone) {
-        setSelectedPhone(phone);
+    if (!selectedPhone && accounts.length > 0) {
+      // Find first active account
+      const activeAccount = accounts.find(a => a.status === 'active');
+      if (activeAccount) {
+        setSelectedPhone(activeAccount.phone);
       }
     }
-  }, [selectedAccounts, accounts, selectedPhone]);
+  }, [accounts, selectedPhone]);
+
+  // Auto-connect when phone is selected and not connected
+  useEffect(() => {
+    const autoConnect = async () => {
+      if (selectedPhone && connectionStatus[selectedPhone] && !connectionStatus[selectedPhone].connected) {
+        // Check if inbox manager is running before attempting to connect
+        try {
+          const response = await getInboxConnectionStatus();
+          if (response.data?.inbox_manager_running && !response.data?.connections?.[selectedPhone]?.connected) {
+            console.log(`Auto-connecting inbox for ${selectedPhone}...`);
+            await connectInbox(selectedPhone);
+            // Refresh status after connection attempt
+            const updatedStatus = await getInboxConnectionStatus();
+            if (updatedStatus.data?.success) {
+              setConnectionStatus(updatedStatus.data.connections || {});
+            }
+          }
+        } catch (err) {
+          console.error('Auto-connect failed:', err);
+        }
+      }
+    };
+    
+    autoConnect();
+  }, [selectedPhone, connectionStatus]);
 
   // Fetch conversations when phone changes
   useEffect(() => {

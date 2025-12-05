@@ -2392,6 +2392,25 @@ class UnifiedContactManager:
                 })
 
                 try:
+                    # Check if client is still connected before each contact
+                    if not self.client or not self.client.is_connected():
+                        self.log(f"   ⚠️  Client disconnected, attempting to reconnect...")
+                        try:
+                            await self.init_client(self.phone_number)
+                            self.log(f"   ✅ Reconnected successfully")
+                        except Exception as reconnect_error:
+                            self.log(f"   ❌ Failed to reconnect: {str(reconnect_error)}", level="ERROR")
+                            # Mark remaining as failed and exit
+                            remaining = total_to_process - processed_count
+                            self.stats['kol_failed'] += remaining
+                            emit_progress(total_to_process, total_to_process, f"❌ Import stopped: connection lost", {
+                                'status': 'connection_lost',
+                                'added': success_count,
+                                'skipped': self.stats['kol_skipped'],
+                                'failed': self.stats['kol_failed']
+                            })
+                            return
+                    
                     # Get display name and user entity
                     display_name, status, user_entity = await self.get_user_display_name(entry['telegram'])
 
@@ -2504,8 +2523,29 @@ class UnifiedContactManager:
                     continue
 
                 except Exception as e:
+                    error_str = str(e)
+                    # Check for connection-related errors
+                    if any(x in error_str for x in ['AUTH_KEY', 'Unauthorized', 'ConnectionError', 'disconnected']):
+                        self.log(f"⚠️  Connection error detected: {error_str}", level="ERROR")
+                        self.log(f"   Attempting to reconnect...")
+                        try:
+                            await self.init_client(self.phone_number)
+                            self.log(f"   ✅ Reconnected, retrying contact...")
+                            # Don't increment counters - we'll retry this contact
+                            continue
+                        except Exception as reconnect_error:
+                            self.log(f"   ❌ Reconnection failed: {str(reconnect_error)}", level="ERROR")
+                            remaining = total_to_process - processed_count
+                            self.stats['kol_failed'] += remaining
+                            emit_progress(total_to_process, total_to_process, f"❌ Import stopped: connection lost", {
+                                'status': 'connection_lost',
+                                'added': success_count,
+                                'skipped': self.stats['kol_skipped'],
+                                'failed': self.stats['kol_failed']
+                            })
+                            return
                     # Check for generic FLOOD errors
-                    if "FLOOD" in str(e):
+                    elif "FLOOD" in error_str:
                         self.log(f"⚠️  Generic FLOOD error - waiting {self.GENERIC_FLOOD_WAIT}s")
                         emit_progress(processed_count, total_to_process, f"⚠️ Flood error - waiting {self.GENERIC_FLOOD_WAIT}s", {
                             'username': entry['telegram'],
@@ -2517,7 +2557,7 @@ class UnifiedContactManager:
                         })
                         await asyncio.sleep(self.GENERIC_FLOOD_WAIT)
                     else:
-                        self.log(f"❌ Error: {str(e)}")
+                        self.log(f"❌ Error: {error_str}")
                     self.stats['kol_failed'] += 1
                     failed_count += 1
                     processed_count += 1
@@ -5393,8 +5433,8 @@ def backup_contacts():
             # Get relative path for frontend (just the filename, not full path)
             filename = Path(backup_path).name
 
-            # Construct correct download URL
-            download_url = f'/logs/{filename}'
+            # Construct correct download URL - file is saved in logs/backups/
+            download_url = f'/logs/backups/{filename}'
 
             reset_operation_state()
             logger.info(f"✅ Backup completed for {mgr.phone_number}: {backup_path} ({contacts_count} contacts)")
@@ -6568,16 +6608,43 @@ def inbox_connection_status():
     """Get connection states for all accounts."""
     global inbox_manager
     try:
-        states = inbox_get_connection_states()
+        states = inbox_get_connection_states() or {}
 
-        # Add connected accounts from GlobalConnectionManager if inbox_manager is running
+        # Get connected accounts from GlobalConnectionManager if inbox_manager is running
         connected_phones = []
         if inbox_manager and inbox_manager._conn_manager:
             connected_phones = inbox_manager._conn_manager.get_connected_accounts()
 
+        # Build connections dict in the format frontend expects: {phone: {connected: bool, ...}}
+        # Include all accounts from database states AND currently connected phones
+        all_phones = set(states.keys()) | set(connected_phones)
+        
+        # Also include all active accounts from the database
+        try:
+            active_accounts = get_active_accounts()
+            for acc in active_accounts:
+                phone = normalize_phone(acc.get('phone', ''))
+                if phone:
+                    all_phones.add(phone)
+        except Exception as e:
+            logger.warning(f"Could not get active accounts: {e}")
+        
+        connections = {}
+        for phone in all_phones:
+            clean_phone = normalize_phone(phone)
+            state_info = states.get(clean_phone, {})
+            connections[clean_phone] = {
+                'connected': clean_phone in connected_phones,
+                'state': state_info.get('state', 'disconnected'),
+                'last_connected': state_info.get('last_connected'),
+                'reconnect_attempts': state_info.get('reconnect_attempts', 0),
+                'error': state_info.get('error'),
+            }
+
         return jsonify({
             'success': True,
-            'states': states,
+            'connections': connections,  # Frontend expects this key
+            'states': states,  # Keep for backward compatibility
             'connected_accounts': connected_phones,
             'inbox_manager_running': inbox_manager is not None and inbox_manager._running
         })
