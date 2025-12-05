@@ -618,7 +618,7 @@ from account_manager import (
     get_account_by_phone, update_account_status, validate_account,
     validate_accounts_batch, delete_account, update_account_last_used,
     get_default_account, set_default_account, get_db_connection,
-    normalize_phone, init_operations_tables,
+    normalize_phone, init_operations_tables, update_account_proxy,
     db_create_operation, db_get_operation, db_update_account_progress,
     db_add_operation_log, db_complete_operation, db_get_active_operations,
     db_get_recent_operations
@@ -1095,17 +1095,86 @@ def handle_unsubscribe(data):
 
 
 # ============================================================================
+# PROXY HELPER FUNCTIONS
+# ============================================================================
+
+def parse_proxy_url(proxy_url: str) -> Optional[Tuple]:
+    """
+    Parse proxy URL into Telethon-compatible format.
+
+    Supports:
+    - http://ip:port
+    - http://user:pass@ip:port
+    - socks5://ip:port
+    - socks5://user:pass@ip:port
+
+    Args:
+        proxy_url: Proxy URL string
+
+    Returns:
+        Tuple for Telethon proxy parameter or None if invalid/empty
+    """
+    if not proxy_url:
+        return None
+
+    try:
+        import socks
+        from urllib.parse import urlparse
+
+        parsed = urlparse(proxy_url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+
+        if not host or not port:
+            logger.warning(f"⚠️  Invalid proxy URL (missing host/port): {proxy_url}")
+            return None
+
+        # Map scheme to socks type
+        if scheme in ('http', 'https'):
+            proxy_type = socks.HTTP
+        elif scheme == 'socks5':
+            proxy_type = socks.SOCKS5
+        elif scheme == 'socks4':
+            proxy_type = socks.SOCKS4
+        else:
+            logger.warning(f"⚠️  Unsupported proxy scheme: {scheme}")
+            return None
+
+        # Build proxy tuple for Telethon
+        # Format: (type, host, port, rdns, username, password)
+        if username and password:
+            proxy = (proxy_type, host, port, True, username, password)
+        else:
+            proxy = (proxy_type, host, port)
+
+        logger.info(f"🔌 Parsed proxy: {scheme}://{host}:{port}" + (f" (with auth)" if username else ""))
+        return proxy
+
+    except ImportError:
+        logger.error("❌ PySocks not installed. Run: pip install pysocks")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Error parsing proxy URL: {e}")
+        return None
+
+
+# ============================================================================
 # UNIFIED CONTACT MANAGER CLASS (previously in matrix.py)
 # ============================================================================
 
 class UnifiedContactManager:
     """Unified manager for all contact operations"""
 
-    def __init__(self, api_id: int, api_hash: str, phone_number: str = ''):
-        """Initialize manager"""
+    def __init__(self, api_id: int, api_hash: str, phone_number: str = '', proxy: str = None):
+        """Initialize manager with optional proxy support"""
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone_number = phone_number
+        self.proxy_url = proxy  # Store raw proxy URL (e.g., "http://ip:port")
+        self.proxy = parse_proxy_url(proxy)  # Parsed Telethon-compatible proxy tuple
 
         # Create phone-number-specific session filename
         if phone_number:
@@ -1220,37 +1289,38 @@ class UnifiedContactManager:
         """Save or update session in the database"""
         if not add_account:
             return  # account_manager not available
-        
+
         try:
             clean_phone = phone_number.replace('+', '').replace('-', '').replace(' ', '')
             session_path = str(self.session_path)
-            
+
             # Get account name from user info if available
             account_name = None
             if me:
                 account_name = f"{me.first_name} {me.last_name}".strip() if me.last_name else me.first_name
-            
+
             # Check if account already exists
             existing = get_account_by_phone(clean_phone) if get_account_by_phone else None
-            
+
             if existing:
                 # Update last used timestamp
                 if update_account_last_used:
                     update_account_last_used(clean_phone)
                 self.log(f"   📝 Updated session in database: {clean_phone}")
             else:
-                # Add new account to database
+                # Add new account to database (including proxy if configured)
                 success = add_account(
                     phone=clean_phone,
                     name=account_name,
                     api_id=self.api_id,
                     api_hash=self.api_hash,
                     session_path=session_path,
-                    status='active'
+                    status='active',
+                    proxy=self.proxy_url  # Include proxy if configured
                 )
                 if success:
-                    self.log(f"   💾 Saved session to database: {clean_phone}")
-                    
+                    self.log(f"   💾 Saved session to database: {clean_phone}" + (f" with proxy: {self.proxy_url}" if self.proxy_url else ""))
+
                     # If this is the first account (no default exists), set it as default
                     try:
                         from account_manager import get_default_account, set_default_account
@@ -1290,7 +1360,8 @@ class UnifiedContactManager:
                                 str(self.session_path).replace('.session', ''),
                                 self.api_id,
                                 self.api_hash,
-                                timeout=30  # 30 second timeout for SQLite operations
+                                timeout=30,  # 30 second timeout for SQLite operations
+                                proxy=self.proxy  # Use proxy if configured
                             )
                             await self.client.connect()
                             break
@@ -1349,9 +1420,11 @@ class UnifiedContactManager:
 
             # Create new session for this phone number
             self.client = TelegramClient(str(self.session_path).replace('.session', ''),
-                                        self.api_id, self.api_hash)
+                                        self.api_id, self.api_hash, proxy=self.proxy)
             self.log(f"\n🔐 Starting authentication with phone: {phone_number}")
             self.log(f"   📝 Session file: {self.session_path.name}")
+            if self.proxy:
+                self.log(f"   🔌 Using proxy: {self.proxy_url}")
             self.log(f"   📱 Check your Telegram app - you'll receive an authentication code")
             await self.client.start(phone=phone_number)
             me = await self.client.get_me()
@@ -1383,7 +1456,7 @@ class UnifiedContactManager:
                 # Check if existing session is valid
                 try:
                     test_client = TelegramClient(str(self.session_path).replace('.session', ''),
-                                                self.api_id, self.api_hash)
+                                                self.api_id, self.api_hash, proxy=self.proxy)
                     await test_client.connect()
                     if not await test_client.is_user_authorized():
                         # Session exists but is expired - delete it
@@ -1394,10 +1467,10 @@ class UnifiedContactManager:
                     # Session file is corrupted or invalid - delete it
                     self.log(f"   🗑️  Deleting invalid session file")
                     self.session_path.unlink(missing_ok=True)
-            
+
             # Create new session for this phone number
             self.client = TelegramClient(str(self.session_path).replace('.session', ''),
-                                        self.api_id, self.api_hash)
+                                        self.api_id, self.api_hash, proxy=self.proxy)
             await self.client.connect()
             
             self.log(f"\n🔐 Starting authentication with phone: {phone_number}")
@@ -3519,16 +3592,19 @@ def get_manager() -> Optional[UnifiedContactManager]:
                     logger.error("❌ Default account has no phone number")
                     return None
 
+                # Get proxy if configured for default account
+                default_proxy = default_account.get('proxy')
+
                 # Add + prefix if not present
                 if not default_phone.startswith('+'):
                     phone_number = f"+{default_phone}"
                 else:
                     phone_number = default_phone
 
-                # Create manager with phone number (but DON'T connect client yet)
+                # Create manager with phone number and proxy (but DON'T connect client yet)
                 # This avoids SQLite session file locking issues
-                manager = UnifiedContactManager(api_id=api_id, api_hash=api_hash, phone_number=phone_number)
-                logger.info("✅ Manager initialized (client will connect on-demand)")
+                manager = UnifiedContactManager(api_id=api_id, api_hash=api_hash, phone_number=phone_number, proxy=default_proxy)
+                logger.info("✅ Manager initialized (client will connect on-demand)" + (f" with proxy: {default_proxy}" if default_proxy else ""))
             except Exception as e:
                 logger.error(f"❌ Failed to initialize manager: {str(e)}")
                 import traceback
@@ -3564,6 +3640,7 @@ def get_manager_for_account(phone: str) -> Optional[UnifiedContactManager]:
         # Get API credentials (prefer account-specific, fall back to global)
         account_api_id = account.get('api_id')
         account_api_hash = account.get('api_hash')
+        account_proxy = account.get('proxy')  # Get proxy if configured
 
         if account_api_id and account_api_hash:
             api_id = account_api_id
@@ -3580,9 +3657,9 @@ def get_manager_for_account(phone: str) -> Optional[UnifiedContactManager]:
         # Format phone number with + prefix
         phone_number = f"+{clean_phone}"
 
-        # Create manager for this specific account
-        mgr = UnifiedContactManager(api_id=api_id, api_hash=api_hash, phone_number=phone_number)
-        logger.info(f"✅ Created manager for account {clean_phone}")
+        # Create manager for this specific account (with proxy if configured)
+        mgr = UnifiedContactManager(api_id=api_id, api_hash=api_hash, phone_number=phone_number, proxy=account_proxy)
+        logger.info(f"✅ Created manager for account {clean_phone}" + (f" with proxy: {account_proxy}" if account_proxy else ""))
 
         return mgr
 
@@ -3695,14 +3772,14 @@ def update_rate_limit():
 def get_single_account_stats(phone):
     """Helper function to get stats for a single account.
 
-    Prefers the auto-generated "latest" backup file for freshest data.
-    Falls back to database-registered backups if not found.
+    ONLY uses the per-account "latest" backup file to prevent cross-account data leakage.
+    Returns zeros with has_backup=False if no backup exists for this account.
 
     Args:
         phone: Phone number (with or without + prefix)
 
     Returns:
-        dict: Stats dictionary or None if no backup found
+        dict: Stats dictionary with has_backup flag (never None)
     """
     import os
     import csv
@@ -3710,53 +3787,35 @@ def get_single_account_stats(phone):
     try:
         clean_phone = phone.replace('+', '').replace('-', '').replace(' ', '')
 
-        # FIRST: Check for auto-generated "latest" backup (freshest data)
+        # ONLY look for this specific account's latest backup file
+        # NO FALLBACK to database or global backups (prevents cross-account data leakage)
         backup_dir = LOGS_DIR / "backups"
         latest_backup_path = backup_dir / f"contacts_{clean_phone}_latest.csv"
 
-        if latest_backup_path.exists():
-            backup_path = str(latest_backup_path)
-            logger.debug(f"Using auto-backup: {latest_backup_path.name}")
-            is_auto_backup = True
-        else:
-            # FALLBACK: Query backups table for this account
-            conn = get_db_connection()
-            cursor = conn.cursor()
+        if not latest_backup_path.exists():
+            # No backup for this account - return zeros with flag
+            logger.debug(f"No backup found for {clean_phone} - returning zeros")
+            return {
+                'phone': clean_phone,
+                'has_backup': False,
+                'total_contacts': 0,
+                'dev_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
+                'kol_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
+                'message': 'No backup yet - run backup to see contacts'
+            }
 
-            # Try different phone formats
-            row = None
-            for phone_format in [clean_phone, f'+{clean_phone}', phone]:
-                cursor.execute('''
-                    SELECT filepath FROM backups
-                    WHERE phone = ?
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                ''', (phone_format,))
-                row = cursor.fetchone()
-                if row:
-                    break
-
-            conn.close()
-
-            if not row:
-                return None
-
-            backup_path = row['filepath']
-            is_auto_backup = False
-
-            # Verify file exists
-            if not os.path.exists(backup_path):
-                logger.warning(f"Backup file not found: {backup_path}")
-                return None
+        backup_path = str(latest_backup_path)
+        logger.debug(f"Using backup: {latest_backup_path.name}")
 
         # Read and analyze the backup file
         stats = {
+            'phone': clean_phone,
+            'has_backup': True,
             'total_contacts': 0,
             'dev_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
             'kol_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
             'backup_file': os.path.basename(backup_path),
             'backup_date': datetime.fromtimestamp(os.path.getmtime(backup_path)).isoformat(),
-            'is_auto_backup': is_auto_backup,
         }
 
         with open(backup_path, 'r', encoding='utf-8') as f:
@@ -3786,7 +3845,15 @@ def get_single_account_stats(phone):
 
     except Exception as e:
         logger.error(f"Error getting stats for {phone}: {str(e)}")
-        return None
+        # Return zeros on error instead of None
+        return {
+            'phone': phone.replace('+', '').replace('-', '').replace(' ', ''),
+            'has_backup': False,
+            'total_contacts': 0,
+            'dev_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
+            'kol_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
+            'error': str(e)
+        }
 
 
 @app.route('/api/stats', methods=['GET'])
@@ -3824,113 +3891,46 @@ def get_statistics():
             }
 
             for phone_num in phone_list:
-                # Get stats for this individual account
+                # Get stats for this individual account (always returns dict, never None)
                 account_stats = get_single_account_stats(phone_num)
 
-                if account_stats:
-                    # Add to aggregated totals
-                    aggregated_stats['total_contacts'] += account_stats.get('total_contacts', 0)
-                    aggregated_stats['dev_contacts']['total'] += account_stats['dev_contacts'].get('total', 0)
-                    aggregated_stats['dev_contacts']['blue'] += account_stats['dev_contacts'].get('blue', 0)
-                    aggregated_stats['dev_contacts']['yellow'] += account_stats['dev_contacts'].get('yellow', 0)
-                    aggregated_stats['kol_contacts']['total'] += account_stats['kol_contacts'].get('total', 0)
-                    aggregated_stats['kol_contacts']['blue'] += account_stats['kol_contacts'].get('blue', 0)
-                    aggregated_stats['kol_contacts']['yellow'] += account_stats['kol_contacts'].get('yellow', 0)
+                # Always add to aggregated totals (zeros if no backup)
+                aggregated_stats['total_contacts'] += account_stats.get('total_contacts', 0)
+                aggregated_stats['dev_contacts']['total'] += account_stats['dev_contacts'].get('total', 0)
+                aggregated_stats['dev_contacts']['blue'] += account_stats['dev_contacts'].get('blue', 0)
+                aggregated_stats['dev_contacts']['yellow'] += account_stats['dev_contacts'].get('yellow', 0)
+                aggregated_stats['kol_contacts']['total'] += account_stats['kol_contacts'].get('total', 0)
+                aggregated_stats['kol_contacts']['blue'] += account_stats['kol_contacts'].get('blue', 0)
+                aggregated_stats['kol_contacts']['yellow'] += account_stats['kol_contacts'].get('yellow', 0)
 
-                    # Store per-account breakdown
-                    aggregated_stats['accounts'].append({
-                        'phone': phone_num,
-                        'stats': account_stats
-                    })
-                else:
-                    # Account has no backup
-                    aggregated_stats['accounts'].append({
-                        'phone': phone_num,
-                        'stats': None,
-                        'error': 'No backup found'
-                    })
+                # Store per-account breakdown with has_backup flag
+                aggregated_stats['accounts'].append({
+                    'phone': phone_num,
+                    'stats': account_stats,
+                    'has_backup': account_stats.get('has_backup', False)
+                })
 
             logger.info(f"📊 Multi-account stats: {len(phone_list)} accounts, {aggregated_stats['total_contacts']} total contacts")
             return jsonify(aggregated_stats)
 
         # Single account stats (backward compatible)
         if phone:
+            # get_single_account_stats always returns a dict (never None)
+            # It includes has_backup flag to indicate if backup exists
             stats = get_single_account_stats(phone)
-
-            if not stats:
-                return jsonify({
-                    'error': f'No backup found for account {phone}',
-                    'total_contacts': 0,
-                    'dev_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
-                    'kol_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
-                }), 404
-
             stats['timestamp'] = datetime.now().isoformat()
-            logger.info(f"📊 Single account stats for {phone}: {stats['total_contacts']} total contacts")
+            logger.info(f"📊 Single account stats for {phone}: {stats['total_contacts']} total contacts (has_backup={stats.get('has_backup', False)})")
             return jsonify(stats)
         else:
-            # Fall back to latest backup globally (existing behavior)
-            logs_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
-            backup_pattern = os.path.join(logs_dir, 'contacts_backup_*.csv')
-            backup_files = glob.glob(backup_pattern)
-
-            if not backup_files:
-                return jsonify({
-                    'error': 'No backup file found',
-                    'reason': 'Please create a backup first using the backup endpoint',
-                    'total_contacts': 0,
-                    'dev_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
-                    'kol_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
-                }), 404
-
-            # Get the most recent backup file
-            latest_backup = max(backup_files, key=os.path.getctime)
-            logger.info(f"📊 Reading stats from backup: {os.path.basename(latest_backup)}")
-
-        # Read and analyze the backup file
-        stats = {
-            'total_contacts': 0,
-            'dev_contacts': {
-                'total': 0,
-                'blue': 0,
-                'yellow': 0,
-            },
-            'kol_contacts': {
-                'total': 0,
-                'blue': 0,
-                'yellow': 0,
-            },
-            'backup_file': os.path.basename(latest_backup),
-            'backup_date': datetime.fromtimestamp(os.path.getctime(latest_backup)).isoformat(),
-        }
-
-        with open(latest_backup, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for contact in reader:
-                first_name = contact.get('first_name', '')
-                if first_name:
-                    stats['total_contacts'] += 1
-
-                    # Check for dev contacts
-                    if '🔵💻' in first_name:
-                        stats['dev_contacts']['total'] += 1
-                        stats['dev_contacts']['blue'] += 1
-                    elif '🟡💻' in first_name:
-                        stats['dev_contacts']['total'] += 1
-                        stats['dev_contacts']['yellow'] += 1
-
-                    # Check for KOL contacts
-                    if '🔵📢' in first_name:
-                        stats['kol_contacts']['total'] += 1
-                        stats['kol_contacts']['blue'] += 1
-                    elif '🟡📢' in first_name:
-                        stats['kol_contacts']['total'] += 1
-                        stats['kol_contacts']['yellow'] += 1
-
-        stats['timestamp'] = datetime.now().isoformat()
-        logger.info(f"📊 Statistics from backup: {stats['total_contacts']} total contacts")
-
-        return jsonify(stats)
+            # Phone parameter is required - no global fallback
+            # This prevents accidentally showing wrong account's stats
+            return jsonify({
+                'error': 'Phone parameter required',
+                'hint': 'Use ?phone=X for single account or ?phones=X,Y for multiple accounts',
+                'total_contacts': 0,
+                'dev_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
+                'kol_contacts': {'total': 0, 'blue': 0, 'yellow': 0},
+            }), 400
 
     except Exception as e:
         logger.error(f"❌ Error getting statistics: {str(e)}")
@@ -5326,20 +5326,93 @@ auth_state = {}
 auth_state_lock = threading.Lock()
 
 
+def trigger_auto_backup(phone: str):
+    """
+    Trigger automatic backup for a newly authenticated account.
+    Runs in a background thread to not block the auth response.
+    Creates per-account backup file (contacts_{phone}_latest.csv) for stats.
+    """
+    def run_backup():
+        try:
+            logger.info(f"📦 Auto-backup starting for {phone}...")
+
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            try:
+                # Get account from database
+                account = get_account_by_phone(phone)
+                if not account:
+                    logger.warning(f"⚠️ Auto-backup: Account {phone} not found in database")
+                    return
+
+                # Get API credentials
+                api_id = account.get('api_id')
+                api_hash = account.get('api_hash')
+                proxy = account.get('proxy')
+
+                # Fall back to global credentials if not set
+                if not api_id or not api_hash:
+                    config = load_config()
+                    api_id = config.get('api_id')
+                    api_hash = config.get('api_hash')
+
+                if not api_id or not api_hash:
+                    logger.warning(f"⚠️ Auto-backup: No API credentials for {phone}")
+                    return
+
+                # Create manager and run backup
+                mgr = UnifiedContactManager(api_id, api_hash, phone, proxy=proxy)
+
+                async def do_backup():
+                    connected = await mgr.init_client(phone)
+                    if not connected:
+                        logger.warning(f"⚠️ Auto-backup: Could not connect for {phone}")
+                        return None, 0
+
+                    try:
+                        filename, count = await mgr.export_all_contacts_backup()
+                        return filename, count
+                    finally:
+                        if mgr.client:
+                            await mgr.client.disconnect()
+
+                filename, count = loop.run_until_complete(do_backup())
+
+                if filename:
+                    logger.info(f"✅ Auto-backup complete for {phone}: {count} contacts saved to {filename}")
+                else:
+                    logger.warning(f"⚠️ Auto-backup failed for {phone}")
+
+            finally:
+                loop.close()
+
+        except Exception as e:
+            logger.error(f"❌ Auto-backup error for {phone}: {str(e)}")
+
+    # Run backup in background thread
+    backup_thread = threading.Thread(target=run_backup, daemon=True)
+    backup_thread.start()
+    logger.info(f"📦 Auto-backup triggered for {phone} (running in background)")
+
+
 @app.route('/api/auth/send-code', methods=['POST'])
 def send_auth_code():
     """
     Send authentication code to phone
 
-    This endpoint supports per-account API credentials.
+    This endpoint supports per-account API credentials and proxy.
     If api_id and api_hash are provided, they will be used for this specific account.
     Otherwise, falls back to global config.json credentials.
+    Proxy can be specified in format "http://ip:port".
     """
     try:
         data = request.get_json()
         phone = data.get('phone')
         account_api_id = data.get('api_id')
         account_api_hash = data.get('api_hash')
+        account_proxy = data.get('proxy')  # Optional proxy URL
 
         if not phone:
             return jsonify({'error': 'phone required'}), 400
@@ -5364,8 +5437,23 @@ def send_auth_code():
         clean_phone = phone.replace('+', '').replace('-', '').replace(' ', '')
         phone_number = f"+{clean_phone}"
 
-        # Create temporary manager for authentication with the appropriate credentials
-        temp_manager = UnifiedContactManager(api_id=api_id, api_hash=api_hash, phone_number=phone_number)
+        # Clear any existing auth state for this phone (prevents stale state issues)
+        with auth_state_lock:
+            old_state = auth_state.pop(clean_phone, None)
+            if old_state:
+                # Close old event loop if it exists
+                old_loop = old_state.get('loop')
+                if old_loop and not old_loop.is_closed():
+                    try:
+                        old_loop.close()
+                    except:
+                        pass
+                logger.info(f"🧹 Cleared previous auth state for {clean_phone}")
+
+        # Create temporary manager for authentication with credentials and optional proxy
+        temp_manager = UnifiedContactManager(api_id=api_id, api_hash=api_hash, phone_number=phone_number, proxy=account_proxy)
+        if account_proxy:
+            logger.info(f"🔌 Using proxy for authentication: {account_proxy}")
 
         # Check if account exists and might need re-authentication
         account = get_account_by_phone(clean_phone)
@@ -5383,7 +5471,7 @@ def send_auth_code():
             result = loop.run_until_complete(temp_manager.start_authentication(phone_number, force_new=force_new))
 
             if result.get('success'):
-                # Store phone_code_hash, manager reference, API credentials, AND the event loop
+                # Store phone_code_hash, manager reference, API credentials, proxy, AND the event loop
                 # The loop must be reused in verify_code/verify_password to avoid
                 # "The asyncio event loop must not change after connection" error
                 with auth_state_lock:
@@ -5393,6 +5481,7 @@ def send_auth_code():
                         'phone_number': phone_number,
                         'api_id': api_id,
                         'api_hash': api_hash,
+                        'proxy': account_proxy,  # Store proxy for saving to database later
                         'loop': loop  # Store the loop to reuse in subsequent auth steps
                     }
 
@@ -5479,6 +5568,10 @@ def verify_auth_code():
             loop.close()
 
             logger.info(f"✅ Authentication successful for {phone_number}")
+
+            # Trigger auto-backup in background to populate stats immediately
+            trigger_auto_backup(clean_phone)
+
             return jsonify({
                 'success': True,
                 'user': result.get('user'),
@@ -5571,6 +5664,10 @@ def verify_auth_password():
             loop.close()
 
             logger.info(f"✅ 2FA authentication successful for {clean_phone}")
+
+            # Trigger auto-backup in background to populate stats immediately
+            trigger_auto_backup(clean_phone)
+
             return jsonify({
                 'success': True,
                 'user': result.get('user'),
@@ -5785,6 +5882,66 @@ def update_account_status_endpoint(phone):
             return jsonify({'error': 'Account not found'}), 404
     except Exception as e:
         logger.error(f"❌ Error updating account status: {str(e)}")
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/accounts/<phone>/proxy', methods=['PUT'])
+def update_account_proxy_endpoint(phone):
+    """
+    Update proxy for an account and invalidate session.
+
+    When proxy is changed, the session file is deleted to force re-authentication.
+    The user must re-authenticate through the new proxy.
+
+    Request body:
+        {
+            "proxy": "http://ip:port" or null to remove proxy
+        }
+
+    Returns:
+        Success message with re-authentication required notice
+    """
+    try:
+        data = request.get_json() if request.get_json() else {}
+        proxy = data.get('proxy')  # Can be None to remove proxy
+
+        # Validate proxy format if provided
+        if proxy:
+            # Basic validation - must start with http://, https://, socks4://, or socks5://
+            if not any(proxy.startswith(scheme) for scheme in ['http://', 'https://', 'socks4://', 'socks5://']):
+                return jsonify({
+                    'error': 'Invalid proxy format. Use: http://ip:port, socks5://ip:port, etc.'
+                }), 400
+
+            # Test parsing the proxy
+            parsed = parse_proxy_url(proxy)
+            if parsed is None:
+                return jsonify({
+                    'error': 'Could not parse proxy URL. Ensure format is correct (e.g., http://192.168.1.1:8080)'
+                }), 400
+
+        # Update proxy and invalidate session
+        success, message = update_account_proxy(phone, proxy)
+
+        if success:
+            # Reset global manager if this was the default account
+            global manager
+            with manager_lock:
+                if manager and manager.phone_number.replace('+', '') == normalize_phone(phone):
+                    manager = None
+                    logger.info(f"🔄 Reset global manager after proxy change for {phone}")
+
+            return jsonify({
+                'success': True,
+                'message': message,
+                'proxy': proxy,
+                'requires_reauth': True
+            })
+        else:
+            return jsonify({'error': message}), 400
+
+    except Exception as e:
+        logger.error(f"❌ Error updating account proxy: {str(e)}")
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 

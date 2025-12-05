@@ -71,7 +71,13 @@ def init_database():
             cursor.execute('ALTER TABLE accounts ADD COLUMN is_default INTEGER DEFAULT 0')
         except sqlite3.OperationalError:
             pass  # Column already exists
-        
+
+        # Add proxy column if it doesn't exist (for existing databases)
+        try:
+            cursor.execute('ALTER TABLE accounts ADD COLUMN proxy TEXT')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         conn.commit()
         conn.close()
         logger.info("✅ Database initialized successfully")
@@ -82,7 +88,8 @@ def init_database():
 
 
 def add_account(phone: str, name: str = None, api_id: int = None, api_hash: str = None,
-                session_path: str = None, notes: str = None, status: str = 'active') -> bool:
+                session_path: str = None, notes: str = None, status: str = 'active',
+                proxy: str = None) -> bool:
     """
     Add a new account to the database
 
@@ -94,6 +101,7 @@ def add_account(phone: str, name: str = None, api_id: int = None, api_hash: str 
         session_path: Path to session file
         notes: Optional notes
         status: Account status (default: 'active')
+        proxy: Proxy URL in format "http://ip:port" (optional)
 
     Returns:
         True if added successfully, False if account already exists
@@ -116,13 +124,13 @@ def add_account(phone: str, name: str = None, api_id: int = None, api_hash: str 
             return False
 
         cursor.execute('''
-            INSERT INTO accounts (phone, name, api_id, api_hash, session_path, status, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (clean_phone, name, api_id, api_hash, session_path, status, notes))
+            INSERT INTO accounts (phone, name, api_id, api_hash, session_path, status, notes, proxy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (clean_phone, name, api_id, api_hash, session_path, status, notes, proxy))
 
         conn.commit()
         conn.close()
-        logger.info(f"✅ Added account: {clean_phone}")
+        logger.info(f"✅ Added account: {clean_phone}" + (f" with proxy: {proxy}" if proxy else ""))
         return True
     except Exception as e:
         logger.error(f"❌ Error adding account: {str(e)}")
@@ -218,6 +226,63 @@ def update_account_last_used(phone: str) -> bool:
     except Exception as e:
         logger.error(f"❌ Error updating last used: {str(e)}")
         return False
+
+
+def update_account_proxy(phone: str, proxy: str = None) -> Tuple[bool, str]:
+    """
+    Update proxy for an account and invalidate session (force re-authentication).
+
+    When proxy is changed, the session file is deleted to force the user to
+    re-authenticate through the new proxy.
+
+    Args:
+        phone: Phone number of the account
+        proxy: Proxy URL in format "http://ip:port" or None to remove proxy
+
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    try:
+        clean_phone = normalize_phone(phone)
+        if not clean_phone:
+            return False, "Invalid phone number"
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Get current account info (including session path)
+        cursor.execute('SELECT session_path, proxy FROM accounts WHERE phone = ?', (clean_phone,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False, f"Account {clean_phone} not found"
+
+        old_proxy = row['proxy']
+        session_path = row['session_path']
+
+        # Update proxy in database
+        cursor.execute('UPDATE accounts SET proxy = ? WHERE phone = ?', (proxy, clean_phone))
+        conn.commit()
+        conn.close()
+
+        # Delete session files to force re-authentication
+        sessions_deleted = 0
+        if session_path:
+            sessions_deleted = _cleanup_session_files(session_path, clean_phone)
+        else:
+            # Try default session path
+            sessions_dir = Path(__file__).parent.parent / "sessions"
+            default_session_path = str(sessions_dir / f"session_{clean_phone}")
+            sessions_deleted = _cleanup_session_files(default_session_path, clean_phone)
+
+        proxy_msg = f"set to {proxy}" if proxy else "removed"
+        logger.info(f"✅ Proxy {proxy_msg} for account {clean_phone}, {sessions_deleted} session file(s) deleted")
+
+        return True, f"Proxy {proxy_msg}. Session invalidated - please re-authenticate."
+
+    except Exception as e:
+        logger.error(f"❌ Error updating proxy: {str(e)}")
+        return False, f"Error updating proxy: {str(e)}"
 
 
 def delete_account(phone: str) -> bool:

@@ -4,6 +4,7 @@ import {
   addAccount,
   deleteAccount,
   updateAccountStatus,
+  updateAccountProxy,
   sendAuthCode,
   verifyAuthCode,
   verifyAuthPassword
@@ -31,7 +32,9 @@ import {
   Sparkles,
   Phone,
   Hash,
-  FileText
+  FileText,
+  Globe,
+  Edit2
 } from 'lucide-react'
 import LoadingSpinner from '../components/LoadingSpinner'
 
@@ -46,12 +49,21 @@ export default function Accounts() {
     api_id: '',
     api_hash: '',
     notes: '',
+    proxy: '',
   })
   const [code, setCode] = useState('')
   const [password, setPassword] = useState('')
   const [authError, setAuthError] = useState(null)
   const [authSuccess, setAuthSuccess] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+
+  // Proxy editing state
+  const [proxyDialogOpen, setProxyDialogOpen] = useState(false)
+  const [editingAccount, setEditingAccount] = useState(null)
+  const [proxyInput, setProxyInput] = useState('')
+  const [proxySubmitting, setProxySubmitting] = useState(false)
+  const [proxyError, setProxyError] = useState(null)
+  const [proxySuccess, setProxySuccess] = useState(false)
 
   useEffect(() => {
     fetchAccounts()
@@ -81,7 +93,14 @@ export default function Accounts() {
       return
     }
 
-    const response = await sendAuthCode(formData.phone, formData.api_id, formData.api_hash)
+    // Validate proxy format if provided
+    if (formData.proxy && !formData.proxy.match(/^(http|https|socks4|socks5):\/\/.+:\d+$/)) {
+      setAuthError('Invalid proxy format. Use: http://ip:port')
+      setSubmitting(false)
+      return
+    }
+
+    const response = await sendAuthCode(formData.phone, formData.api_id, formData.api_hash, formData.proxy)
     setSubmitting(false)
 
     if (response.success) {
@@ -137,18 +156,28 @@ export default function Accounts() {
   }
 
   const handleAccountAdded = async () => {
-    // Add account to database with metadata
+    // The backend already saves the account during authentication via _save_session_to_database()
+    // This call is just to update any additional metadata (name, notes) if the user provided them
+    // We don't treat "already exists" as an error since that's expected
+
     const accountData = {
       phone: formData.phone,
       name: formData.name || formData.phone,
       api_id: formData.api_id,
       api_hash: formData.api_hash,
       notes: formData.notes || '',
+      proxy: formData.proxy || null,
       status: 'active'
     }
 
     const response = await addAccount(accountData)
-    if (response.success) {
+    // Success OR "account already exists" are both OK
+    // (backend saves account during auth, so it may already exist)
+    const isSuccess = response.success ||
+      (response.error?.response?.data?.error === 'Account already exists') ||
+      (response.error?.message?.includes('already exists'))
+
+    if (isSuccess) {
       setAuthSuccess(true)
       setAuthStep('success')
       setTimeout(() => {
@@ -156,7 +185,7 @@ export default function Accounts() {
         fetchAccounts()
       }, 2000)
     } else {
-      setAuthError(response.error?.message || 'Failed to save account')
+      setAuthError(response.error?.response?.data?.error || response.error?.message || 'Failed to save account')
     }
   }
 
@@ -169,11 +198,47 @@ export default function Accounts() {
       api_id: '',
       api_hash: '',
       notes: '',
+      proxy: '',
     })
     setCode('')
     setPassword('')
     setAuthError(null)
     setAuthSuccess(false)
+  }
+
+  // Proxy editing handlers
+  const openProxyDialog = (account) => {
+    setEditingAccount(account)
+    setProxyInput(account.proxy || '')
+    setProxyError(null)
+    setProxySuccess(false)
+    setProxyDialogOpen(true)
+  }
+
+  const handleUpdateProxy = async () => {
+    setProxyError(null)
+    setProxySubmitting(true)
+
+    // Validate proxy format if provided
+    if (proxyInput && !proxyInput.match(/^(http|https|socks4|socks5):\/\/.+:\d+$/)) {
+      setProxyError('Invalid proxy format. Use: http://ip:port')
+      setProxySubmitting(false)
+      return
+    }
+
+    const response = await updateAccountProxy(editingAccount.phone, proxyInput || null)
+    setProxySubmitting(false)
+
+    if (response.success) {
+      setProxySuccess(true)
+      setTimeout(() => {
+        setProxyDialogOpen(false)
+        setProxySuccess(false)
+        fetchAccounts()
+      }, 1500)
+    } else {
+      setProxyError(response.error?.response?.data?.error || response.error?.message || 'Failed to update proxy')
+    }
   }
 
   const handleDeleteAccount = async (phone) => {
@@ -337,6 +402,22 @@ export default function Accounts() {
                     </div>
                   </div>
                   <div className="space-y-2">
+                    <Label htmlFor="proxy" className="flex items-center gap-2">
+                      <Globe className="h-4 w-4 text-muted-foreground" />
+                      Proxy (Optional)
+                    </Label>
+                    <Input
+                      id="proxy"
+                      placeholder="http://ip:port"
+                      value={formData.proxy}
+                      onChange={(e) => handleFormChange('proxy', e.target.value)}
+                      className="h-11 font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Format: http://ip:port or socks5://ip:port
+                    </p>
+                  </div>
+                  <div className="space-y-2">
                     <Label htmlFor="notes" className="flex items-center gap-2">
                       <FileText className="h-4 w-4 text-muted-foreground" />
                       Notes (Optional)
@@ -477,6 +558,7 @@ export default function Accounts() {
                   <TableHead className="pl-6">Account</TableHead>
                   <TableHead>Phone</TableHead>
                   <TableHead>Status</TableHead>
+                  <TableHead>Proxy</TableHead>
                   <TableHead>Notes</TableHead>
                   <TableHead className="text-right pr-6">Actions</TableHead>
                 </TableRow>
@@ -514,6 +596,26 @@ export default function Accounts() {
                         {account.status}
                       </Badge>
                     </TableCell>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        {account.proxy ? (
+                          <span className="font-mono text-xs text-muted-foreground max-w-[150px] truncate" title={account.proxy}>
+                            {account.proxy}
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground text-xs">No proxy</span>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100"
+                          onClick={() => openProxyDialog(account)}
+                          title="Edit proxy"
+                        >
+                          <Edit2 className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    </TableCell>
                     <TableCell className="max-w-xs truncate text-muted-foreground text-sm">
                       {account.notes || '-'}
                     </TableCell>
@@ -544,6 +646,83 @@ export default function Accounts() {
           )}
         </CardContent>
       </Card>
+
+      {/* Proxy Edit Dialog */}
+      <Dialog open={proxyDialogOpen} onOpenChange={setProxyDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Globe className="h-5 w-5 text-primary" />
+              Edit Proxy
+            </DialogTitle>
+            <DialogDescription>
+              {editingAccount && (
+                <>Update proxy for account <strong>{editingAccount.name || editingAccount.phone}</strong></>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+
+          {proxyError && (
+            <Alert variant="destructive" className="border-red-500/30 bg-red-500/5">
+              <AlertCircle className="h-4 w-4" />
+              <AlertDescription>{proxyError}</AlertDescription>
+            </Alert>
+          )}
+
+          {proxySuccess && (
+            <Alert className="border-green-500/30 bg-green-500/5">
+              <CheckCircle className="h-4 w-4 text-green-500" />
+              <AlertDescription className="text-green-500">
+                Proxy updated! Session invalidated - please re-authenticate.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="edit-proxy" className="flex items-center gap-2">
+                <Globe className="h-4 w-4 text-muted-foreground" />
+                Proxy URL
+              </Label>
+              <Input
+                id="edit-proxy"
+                placeholder="http://ip:port"
+                value={proxyInput}
+                onChange={(e) => setProxyInput(e.target.value)}
+                className="h-11 font-mono"
+                disabled={proxySubmitting || proxySuccess}
+              />
+              <p className="text-xs text-muted-foreground">
+                Format: http://ip:port or socks5://ip:port (leave empty to remove proxy)
+              </p>
+            </div>
+
+            <Alert className="border-orange-500/30 bg-orange-500/5">
+              <AlertCircle className="h-4 w-4 text-orange-500" />
+              <AlertDescription className="text-muted-foreground text-sm">
+                Changing proxy will <strong>log you out</strong> of this account. You will need to re-authenticate.
+              </AlertDescription>
+            </Alert>
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setProxyDialogOpen(false)}
+              disabled={proxySubmitting}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleUpdateProxy}
+              disabled={proxySubmitting || proxySuccess}
+              className="hover-scale"
+            >
+              {proxySubmitting ? 'Updating...' : 'Update Proxy'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -447,6 +447,15 @@ export const updateAccountStatus = async (phone, status) => {
   }
 }
 
+export const updateAccountProxy = async (phone, proxy) => {
+  try {
+    const response = await apiClient.put(`/accounts/${encodeURIComponent(phone)}/proxy`, { proxy })
+    return { success: true, data: response.data }
+  } catch (error) {
+    return { success: false, error }
+  }
+}
+
 // Multi-account imports
 export const importDevsMulti = async (csvPath, accountPhones, dryRun = false) => {
   try {
@@ -519,13 +528,18 @@ export const getAuditLog = async (params = {}) => {
 }
 
 // Authentication Flow
-export const sendAuthCode = async (phone, apiId, apiHash) => {
+export const sendAuthCode = async (phone, apiId, apiHash, proxy = null) => {
   try {
-    const response = await apiClient.post('/auth/send-code', {
+    const payload = {
       phone,
       api_id: apiId,
       api_hash: apiHash
-    })
+    }
+    // Only include proxy if provided (to avoid sending empty string)
+    if (proxy) {
+      payload.proxy = proxy
+    }
+    const response = await apiClient.post('/auth/send-code', payload)
     return { success: true, data: response.data }
   } catch (error) {
     return { success: false, error }

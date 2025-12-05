@@ -72,30 +72,29 @@ function Dashboard({ isConnected }) {
 
       if (statsRes.success) {
         setStats(statsRes.data)
-        // Check if any account has no backup (show warning, not error)
+        // Check if any account has no backup using has_backup flag
         if (statsRes.data?.accounts) {
-          const missingBackups = statsRes.data.accounts.filter(acc => !acc.stats)
+          const missingBackups = statsRes.data.accounts.filter(acc => !acc.has_backup)
           if (missingBackups.length > 0) {
             const names = missingBackups.map(acc => acc.phone).join(', ')
-            setError(`No backup found for: ${names}. Run backup first to see stats.`)
+            setError(`No backup yet for: ${names}. Run backup to see contacts.`)
           }
+        } else if (statsRes.data?.has_backup === false) {
+          // Single account with no backup
+          setError('No backup yet - run backup to see contacts.')
         }
       } else {
-        // Handle 404 or other errors - likely no backup exists
+        // Handle errors (400 = phone required, other errors)
         const errorMsg = statsRes.error?.response?.data?.error ||
                         statsRes.error?.message ||
                         'Failed to load stats'
-        if (errorMsg.includes('No backup found')) {
-          setError('No backup found for selected account(s). Click "Backup Contacts" to create one.')
-          // Set empty stats so UI doesn't break
-          setStats({
-            total_contacts: 0,
-            dev_contacts: { total: 0, blue: 0, yellow: 0 },
-            kol_contacts: { total: 0, blue: 0, yellow: 0 }
-          })
-        } else {
-          setError(errorMsg)
-        }
+        setError(errorMsg)
+        // Set empty stats so UI doesn't break
+        setStats({
+          total_contacts: 0,
+          dev_contacts: { total: 0, blue: 0, yellow: 0 },
+          kol_contacts: { total: 0, blue: 0, yellow: 0 }
+        })
       }
 
       if (statusRes.success) {
@@ -378,18 +377,19 @@ function Dashboard({ isConnected }) {
             {stats.accounts.map((accountData, idx) => {
               const accountInfo = selectedAccounts.find(acc => acc.phone === accountData.phone)
               const accountStats = accountData.stats
+              const hasBackup = accountData.has_backup !== false && accountStats?.has_backup !== false
 
-              if (!accountStats) {
+              if (!hasBackup) {
                 return (
-                  <div key={idx} className="p-4 bg-red-500/5 rounded-xl border border-red-500/20">
+                  <div key={idx} className="p-4 bg-yellow-500/5 rounded-xl border border-yellow-500/20">
                     <div className="flex items-center gap-3">
-                      <AlertCircle className="h-5 w-5 text-red-500" />
+                      <Download className="h-5 w-5 text-yellow-500" />
                       <div>
                         <p className="font-medium text-foreground">
                           {accountInfo?.name || accountData.phone}
                         </p>
-                        <p className="text-sm text-red-400">
-                          No backup found for this account
+                        <p className="text-sm text-yellow-400">
+                          No backup yet - run backup to see contacts
                         </p>
                       </div>
                     </div>

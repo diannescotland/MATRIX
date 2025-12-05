@@ -771,6 +771,79 @@ Implemented multi-account selection for Operations page with WebSocket real-time
 
 ---
 
+## Recent Fixes (December 5, 2025)
+
+### ✅ Proxy Support for Telegram Accounts (COMPLETED)
+**Status:** DONE
+**Date:** December 5, 2025
+
+Added proxy support for individual Telegram accounts with format `http://ip:port`.
+
+**Features:**
+- Each account can have its own proxy configuration
+- Changing proxy invalidates session (forces re-authentication)
+- Proxy is stored in database and used for all Telegram connections
+
+**Files Changed:**
+- `backend/account_manager.py` - Added `proxy` column migration, `update_account_proxy()` function
+- `backend/api_server.py`:
+  - Added `parse_proxy_url()` helper (converts URL to Telethon format)
+  - Updated `UnifiedContactManager.__init__()` to accept proxy
+  - Updated all 4 `TelegramClient` instantiations with `proxy=self.proxy`
+  - Added `PUT /api/accounts/<phone>/proxy` endpoint
+- `frontend/src/services/api.js` - Added `updateAccountProxy()`, updated `sendAuthCode()` with proxy
+- `frontend/src/pages/Accounts.jsx` - Added proxy input field and edit dialog
+
+### ✅ Stats Fix for New Accounts (COMPLETED)
+**Status:** DONE
+**Date:** December 5, 2025
+
+Fixed bug where new accounts showed wrong stats (other account's data instead of zeros).
+
+**Root Cause:** `get_single_account_stats()` had fallback logic to database `backups` table which could match wrong account's backup file.
+
+**Fix:**
+1. `get_single_account_stats()` now ONLY uses `contacts_{phone}_latest.csv`
+2. Returns zeros with `has_backup: false` flag instead of falling back
+3. Removed global backup fallback in `/api/stats` endpoint
+4. Frontend handles `has_backup: false` with friendly message
+
+**Files Changed:**
+- `backend/api_server.py`:
+  - Lines 3772-3856: Simplified `get_single_account_stats()` - no fallback, returns zeros
+  - Lines 3916-3933: Removed global backup fallback, requires phone parameter
+- `frontend/src/pages/Dashboard.jsx`:
+  - Check `has_backup` flag instead of null stats
+  - Show yellow "No backup yet" message for accounts without backup
+
+### ✅ Auto-Backup After Authentication (COMPLETED)
+**Status:** DONE
+**Date:** December 5, 2025
+
+Automatically backup contacts immediately after successful account authentication.
+
+**Purpose:** Stats show correct data from the start instead of "No backup yet" message.
+
+**Implementation:**
+- Added `trigger_auto_backup(phone)` helper function (runs in background thread)
+- Called after successful code verification (non-2FA accounts)
+- Called after successful password verification (2FA accounts)
+
+**Files Changed:**
+- `backend/api_server.py`:
+  - Lines 5329-5397: Added `trigger_auto_backup()` function
+  - Line 5573: Added call in `verify_auth_code()` endpoint
+  - Line 5669: Added call in `verify_auth_password()` endpoint
+
+**How It Works:**
+1. User completes authentication (code or 2FA password)
+2. Backend returns success response immediately
+3. Background thread starts backup process
+4. Creates `contacts_{phone}_latest.csv` file
+5. Stats endpoint now finds the backup and shows correct data
+
+---
+
 ## Pending Features & Next Steps
 
 *No pending features at this time. All requested features have been implemented.*
