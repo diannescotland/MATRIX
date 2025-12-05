@@ -18,6 +18,7 @@ import Settings from './pages/Settings'
 import Logs from './pages/Logs'
 import Accounts from './pages/Accounts'
 import AuditLog from './pages/AuditLog'
+import Inbox from './pages/Inbox'
 
 // Import Components
 import Navbar from './components/Navbar'
@@ -52,6 +53,7 @@ function App() {
               <main className="flex-1 overflow-y-auto overflow-x-hidden bg-background relative">
                 <Routes>
                   <Route path="/" element={<Dashboard isConnected={isConnected} />} />
+                  <Route path="/inbox" element={<Inbox isConnected={isConnected} />} />
                   <Route path="/contacts" element={<Contacts isConnected={isConnected} />} />
                   <Route path="/import" element={<Import isConnected={isConnected} />} />
                   <Route path="/operations" element={<Operations isConnected={isConnected} />} />

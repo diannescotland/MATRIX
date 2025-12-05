@@ -608,4 +608,152 @@ export const getOperationDetails = async (operationId) => {
   }
 }
 
+// ============================================================================
+// INBOX API FUNCTIONS
+// Real-time inbox management system
+// ============================================================================
+
+// Inbox Connection
+export const connectInbox = async (phone) => {
+  try {
+    const response = await apiClient.post('/inbox/connect', { phone })
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+export const disconnectInbox = async (phone) => {
+  try {
+    const response = await apiClient.post('/inbox/disconnect', { phone })
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+export const connectAllInbox = async () => {
+  try {
+    const response = await apiClient.post('/inbox/connect-all')
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+export const getInboxConnectionStatus = async () => {
+  try {
+    const response = await apiClient.get('/inbox/connection-status')
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+// Inbox Conversations
+export const getInboxConversations = async (phone, params = {}) => {
+  try {
+    const response = await apiClient.get(`/inbox/${encodeURIComponent(phone)}/conversations`, {
+      params
+    })
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+export const getInboxConversation = async (phone, peerId) => {
+  try {
+    const response = await apiClient.get(
+      `/inbox/${encodeURIComponent(phone)}/conversations/${peerId}`
+    )
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+// Inbox Messages
+export const getInboxMessages = async (phone, peerId, params = {}) => {
+  try {
+    const response = await apiClient.get(
+      `/inbox/${encodeURIComponent(phone)}/conversations/${peerId}/messages`,
+      { params }
+    )
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+// Send Message
+export const sendInboxMessage = async (phone, peerId, text, campaignId = null) => {
+  try {
+    const payload = { peer_id: peerId, text }
+    if (campaignId) {
+      payload.campaign_id = campaignId
+    }
+    const response = await apiClient.post(
+      `/inbox/${encodeURIComponent(phone)}/send`,
+      payload
+    )
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+export const getInboxRateLimitStatus = async (phone) => {
+  try {
+    const response = await apiClient.get(
+      `/inbox/${encodeURIComponent(phone)}/rate-limit`
+    )
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+// Inbox Sync
+export const triggerDialogSync = async (phone) => {
+  try {
+    const response = await apiClient.post(
+      `/inbox/${encodeURIComponent(phone)}/sync/dialogs`
+    )
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+export const triggerFullSync = async (phone) => {
+  try {
+    const response = await apiClient.post(
+      `/inbox/${encodeURIComponent(phone)}/sync/full`
+    )
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+// Inbox Metrics
+export const getInboxMetrics = async (params = {}) => {
+  try {
+    const response = await apiClient.get('/inbox/metrics', { params })
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
+export const getCampaignMetrics = async (campaignId) => {
+  try {
+    const response = await apiClient.get(`/inbox/campaigns/${campaignId}/metrics`)
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
 export default apiClient

@@ -1,7 +1,7 @@
 # MATRIX - AI Assistant Context Document
 
 **Purpose:** Quick reference for Claude/AI assistants in future sessions
-**Last Updated:** December 4, 2025
+**Last Updated:** December 5, 2025
 **Project:** Web3/Crypto Telegram Contact Management System
 
 ---
@@ -32,7 +32,9 @@ Multi-account Telegram contact manager for Web3/crypto outreach campaigns. Track
 backend/
 ├── api_server.py           # 🔴 UNIFIED FILE - API + Telegram core logic (~5000 lines)
 │                           # Contains: Flask API, UnifiedContactManager, rate limiting
-├── account_manager.py      # 🔴 Database CRUD - accounts & backups tables (447 lines)
+├── inbox_manager.py        # 🔴 Real-time inbox - persistent Telegram connections (~800 lines)
+│                           # Contains: InboxManager, ConnectionPool, message handlers
+├── account_manager.py      # 🔴 Database CRUD - accounts, backups, inbox tables (~600 lines)
 ├── NEXT_SESSION_README.md  # Future improvements documentation
 ├── api_server.py.backup    # Backup before unification
 └── matrix.py.backup        # Backup of original matrix.py (CLI removed)
@@ -44,8 +46,10 @@ backend/
 ```
 frontend/src/
 ├── services/api.js         # 🔴 API client - validation, caching, retry logic (499 lines)
+├── hooks/useInbox.js       # WebSocket hook for inbox real-time updates
 ├── pages/
 │   ├── Dashboard.jsx       # Stats, quick actions, account selector
+│   ├── Inbox.jsx           # 🔴 WhatsApp-style messaging interface (~500 lines)
 │   ├── Operations.jsx      # Scan, folders, backup operations
 │   ├── Accounts.jsx        # Account management, auth flow
 │   └── Import.jsx          # CSV import for devs/KOLs
@@ -323,6 +327,107 @@ if phone:
     mgr = get_manager_for_account(phone)  # Specific account
 else:
     mgr = get_manager()  # Default account
+```
+
+### ✅ Issue #8: Session File Locking - Dual Client Architecture (FIXED)
+**Symptom:** "The process cannot access the file because it is being used by another process" when running operations while inbox is active
+**Cause:** Two separate systems create TelegramClient instances that conflict over the same session files
+**Status:** ✅ FIXED on December 5, 2025
+
+**Root Cause:**
+The system had TWO separate components that both created TelegramClient instances:
+1. **InboxManager** - Kept persistent connections via ConnectionPool
+2. **UnifiedContactManager** - Created NEW clients for each operation
+
+Both tried to access the same session files, causing file lock conflicts.
+
+**Solution Implemented: GlobalConnectionManager Singleton**
+Created `backend/connection_manager.py` with a singleton that owns ALL TelegramClient instances.
+Both InboxManager and UnifiedContactManager now share clients from this pool.
+
+**Files Changed:**
+| File | Changes |
+|------|---------|
+| `backend/connection_manager.py` | **NEW** - GlobalConnectionManager singleton (~350 lines) |
+| `backend/inbox_manager.py` | Removed ConnectionPool, now uses GlobalConnectionManager |
+| `backend/api_server.py` | Modified `UnifiedContactManager.init_client()` to use shared pool, updated startup |
+
+**How It Works Now:**
+```
+GlobalConnectionManager (singleton)
+        │
+        └── _clients: Dict[phone, TelegramClient]  ← ONE client per account
+                │
+    ┌───────────┴───────────┐
+    ▼                       ▼
+InboxManager          UnifiedContactManager
+(real-time events)    (import/scan/backup)
+    │                       │
+    └───── SAME CLIENT ─────┘  ← No more file locking!
+```
+
+**Key Changes:**
+- `GlobalConnectionManager.get_client(phone)` returns existing or creates new client
+- `UnifiedContactManager.__init__()` now accepts optional `conn_manager` parameter
+- `get_manager_for_account()` passes GlobalConnectionManager singleton
+- Server startup initializes GlobalConnectionManager BEFORE InboxManager
+
+### ✅ Issue #9: InboxManager._pool AttributeError (FIXED)
+**Symptom:** `'InboxManager' object has no attribute '_pool'` error on `/api/inbox/connection-status`
+**Cause:** Code still referenced old `inbox_manager._pool` after migration to GlobalConnectionManager
+**Status:** ✅ FIXED on December 5, 2025
+
+**Location:** `api_server.py:6487-6488` and `api_server.py:6777-6778`
+
+**Fix:** Changed `inbox_manager._pool` to `inbox_manager._conn_manager`:
+```python
+# Before (broken):
+if inbox_manager and inbox_manager._pool:
+    connected_phones = inbox_manager._pool.get_connected_accounts()
+
+# After (fixed):
+if inbox_manager and inbox_manager._conn_manager:
+    connected_phones = inbox_manager._conn_manager.get_connected_accounts()
+```
+
+### ✅ Issue #10: Flask Endpoint Asyncio Loop Conflicts (FIXED)
+**Symptom:** `The asyncio event loop must not change after connection` when running backup/scan/import while inbox is active
+**Cause:** Flask endpoints created new event loops but GlobalConnectionManager returned clients from InboxManager's background loop
+**Status:** ✅ FIXED on December 5, 2025
+
+**Root Cause:**
+1. InboxManager runs in a background thread with its own asyncio loop
+2. GlobalConnectionManager creates clients in that loop
+3. Flask endpoints create NEW loops with `asyncio.new_event_loop()`
+4. When Flask asks for a client, it gets one connected in a different loop
+5. Telethon rejects operations because the loop changed
+
+**Fix Implemented:**
+1. All Flask endpoints now use `get_manager_for_account(phone, use_shared_connection=False)`
+2. Before connecting, Flask endpoints disconnect from GlobalConnectionManager first
+3. Fresh clients are created in the Flask endpoint's own event loop
+
+**Files Changed:** `api_server.py` - Multiple Flask endpoints:
+- `backup_contacts()` - Lines 5271-5298
+- `scan_replies()` - Lines 4997-5016
+- `organize_folders()` - Lines 5212-5220
+- `import_devs()` run_import thread - Lines 4263-4271
+- `import_kols()` run_import thread - Lines 4404-4412
+- `_execute_account_operation()` - Lines 4802-4810
+
+**Pattern Applied:**
+```python
+# Step 1: Use non-shared connection
+mgr = get_manager_for_account(phone, use_shared_connection=False)
+
+# Step 2: Disconnect from GlobalConnectionManager first
+clean_phone = normalize_phone(mgr.phone_number)
+global_conn_manager = GlobalConnectionManager.get_instance()
+if global_conn_manager.is_connected(clean_phone):
+    loop.run_until_complete(global_conn_manager.disconnect_account(clean_phone))
+
+# Step 3: Now connect fresh client in this loop
+connected = loop.run_until_complete(mgr.init_client(mgr.phone_number))
 ```
 
 ---
@@ -842,11 +947,71 @@ Automatically backup contacts immediately after successful account authenticatio
 4. Creates `contacts_{phone}_latest.csv` file
 5. Stats endpoint now finds the backup and shows correct data
 
+### ✅ Inbox System UI & Backend (COMPLETED)
+**Status:** DONE (Issue #8 fixed - session file locking resolved!)
+**Date:** December 5, 2025
+
+Implemented WhatsApp-style inbox with real-time message updates.
+
+**New Files Created:**
+- `frontend/src/pages/Inbox.jsx` - Main inbox UI (~500 lines)
+  - Left panel: account selector, connection status, conversation list
+  - Right panel: message thread with send functionality
+  - Components: ConversationItem, MessageBubble, RateLimitIndicator
+- `frontend/src/hooks/useInbox.js` - WebSocket subscription hook
+- `backend/inbox_manager.py` - Persistent Telegram connections (~800 lines)
+  - `ConnectionPool` class for managing persistent TelegramClient instances
+  - `InboxManager` class for handling real-time events
+  - First-reply detection (🔵→🟡 auto-update)
+
+**Files Modified:**
+- `frontend/src/App.jsx` - Added `/inbox` route
+- `frontend/src/components/Sidebar.jsx` - Added Inbox nav item with MessageCircle icon
+- `backend/account_manager.py` - Added inbox tables and functions:
+  - `inbox_link_matrix_contact()` - Links imported contacts to inbox system
+  - `inbox_get_matrix_contact()` - Gets MATRIX contact by peer_id or username
+  - `inbox_get_blue_contacts()` - Gets all blue (unreplied) contacts
+  - `inbox_update_contact_status()` - Updates contact status (🔵→🟡)
+- `backend/api_server.py`:
+  - Campaign integration in import functions
+  - Graceful shutdown with signal handlers
+  - InboxManager startup in background thread
+
+**WebSocket Events:**
+- `inbox_connect` - Connect to inbox for specific account
+- `inbox_connected` - Account connection confirmed
+- `inbox_new_message` - Real-time new message notification
+- `inbox_first_reply` - First reply detected (for campaign tracking)
+
+**Note:** Issue #8 (session file conflicts) has been FIXED - inbox and operations now work together!
+
 ---
 
 ## Pending Features & Next Steps
 
 *No pending features at this time. All requested features have been implemented.*
+
+### ✅ Session File Locking Fix (Issue #8) - COMPLETED
+**Date:** December 5, 2025
+
+**Solution Implemented:**
+1. Created `backend/connection_manager.py` with GlobalConnectionManager singleton (~350 lines)
+2. Modified `inbox_manager.py` - removed ConnectionPool, now uses GlobalConnectionManager
+3. Modified `api_server.py` - updated UnifiedContactManager.init_client() to use shared clients
+4. Server now logs: "🔗 Operations will now share connections with inbox (no more file locking!)"
+
+### ✅ Inbox System Implementation (COMPLETED)
+**Status:** UI and backend complete, Issue #8 fix deployed
+
+**Completed Components:**
+- `frontend/src/pages/Inbox.jsx` - WhatsApp-style UI with conversation list + message thread
+- `frontend/src/hooks/useInbox.js` - WebSocket subscription hook
+- `backend/inbox_manager.py` - Persistent connections, message handlers, first-reply detection
+- `backend/connection_manager.py` - **NEW** GlobalConnectionManager for shared connections
+- `backend/account_manager.py` - Added inbox tables and MATRIX contact linking functions
+- `backend/api_server.py` - Graceful shutdown, campaign integration
+
+**Now Working:** Inbox and Operations can be used simultaneously without file locking errors!
 
 ---
 

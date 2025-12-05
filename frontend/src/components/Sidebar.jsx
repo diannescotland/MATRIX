@@ -10,7 +10,8 @@ import {
   FileText,
   Menu,
   X,
-  Zap
+  Zap,
+  MessageCircle
 } from 'lucide-react'
 
 function Sidebar() {
@@ -19,6 +20,7 @@ function Sidebar() {
 
   const navItems = [
     { label: 'Dashboard', path: '/', icon: LayoutDashboard },
+    { label: 'Inbox', path: '/inbox', icon: MessageCircle },
     { label: 'Contacts', path: '/contacts', icon: Users },
     { label: 'Import', path: '/import', icon: Upload },
     { label: 'Operations', path: '/operations', icon: Settings2 },

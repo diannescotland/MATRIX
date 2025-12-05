@@ -621,13 +621,34 @@ from account_manager import (
     normalize_phone, init_operations_tables, update_account_proxy,
     db_create_operation, db_get_operation, db_update_account_progress,
     db_add_operation_log, db_complete_operation, db_get_active_operations,
-    db_get_recent_operations
+    db_get_recent_operations,
+    # Inbox management functions
+    init_inbox_tables, inbox_get_or_create_conversation, inbox_update_conversation,
+    inbox_get_conversations, inbox_insert_message, inbox_get_messages,
+    inbox_mark_messages_read, inbox_soft_delete_messages,
+    inbox_update_connection_state, inbox_get_connection_states,
+    inbox_increment_reconnect_attempts, inbox_record_dm_sent, inbox_check_dm_sent,
+    inbox_get_dm_count_today, inbox_ensure_campaign, inbox_update_campaign_metrics,
+    inbox_get_campaign_metrics, inbox_log_event, inbox_get_conversations_needing_backfill,
+    inbox_link_matrix_contact
 )
 logger.info("✅ Successfully imported account_manager")
+
+# Import inbox manager
+from inbox_manager import InboxManager
+logger.info("✅ Successfully imported inbox_manager")
+
+# Import GlobalConnectionManager for shared TelegramClient management
+from connection_manager import GlobalConnectionManager
+logger.info("✅ Successfully imported GlobalConnectionManager")
 
 # Global manager instance (will be initialized on first API call)
 manager = None
 manager_lock = threading.Lock()
+
+# Global inbox manager instance (for real-time messaging)
+inbox_manager: Optional[InboxManager] = None
+inbox_manager_thread: Optional[threading.Thread] = None
 
 
 class AccountLockManager:
@@ -1168,13 +1189,27 @@ def parse_proxy_url(proxy_url: str) -> Optional[Tuple]:
 class UnifiedContactManager:
     """Unified manager for all contact operations"""
 
-    def __init__(self, api_id: int, api_hash: str, phone_number: str = '', proxy: str = None):
-        """Initialize manager with optional proxy support"""
+    def __init__(self, api_id: int, api_hash: str, phone_number: str = '', proxy: str = None,
+                 conn_manager: GlobalConnectionManager = None):
+        """
+        Initialize manager with optional proxy support and shared connection manager.
+
+        Args:
+            api_id: Telegram API ID
+            api_hash: Telegram API Hash
+            phone_number: Phone number for this account
+            proxy: Proxy URL (e.g., "http://ip:port")
+            conn_manager: Optional GlobalConnectionManager instance for shared connections.
+                         If provided, uses shared client pool instead of creating own client.
+        """
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone_number = phone_number
         self.proxy_url = proxy  # Store raw proxy URL (e.g., "http://ip:port")
         self.proxy = parse_proxy_url(proxy)  # Parsed Telethon-compatible proxy tuple
+
+        # GlobalConnectionManager for shared client access (solves session file locking)
+        self._conn_manager = conn_manager
 
         # Create phone-number-specific session filename
         if phone_number:
@@ -1341,10 +1376,41 @@ class UnifiedContactManager:
 
     async def init_client(self, phone_number: str, force_new: bool = False) -> bool:
         """
-        Initialize Telegram client
+        Initialize Telegram client.
+
+        If GlobalConnectionManager is available (self._conn_manager), uses shared client pool.
+        This prevents session file locking conflicts with InboxManager.
+
         Returns True if successful, False otherwise
         """
         try:
+            # ========================================
+            # NEW: Use GlobalConnectionManager if available (shared client pool)
+            # This solves session file locking between inbox and operations
+            # ========================================
+            if self._conn_manager is not None and not force_new:
+                self.log(f"🔗 Using shared connection pool for {phone_number}")
+                session_path = str(self.session_path).replace('.session', '')
+                self.client = await self._conn_manager.get_client(
+                    phone_number,
+                    self.api_id,
+                    self.api_hash,
+                    session_path,
+                    self.proxy_url,
+                    register_events=False  # Operations don't need event handlers
+                )
+                if self.client:
+                    self.log(f"✅ Got shared client for {phone_number}")
+                    return True
+                else:
+                    self.log(f"⚠️  Failed to get shared client, account may need authentication")
+                    return False
+
+            # ========================================
+            # ORIGINAL: Direct client creation (for authentication flows)
+            # Used when conn_manager is not set (auth) or force_new=True
+            # ========================================
+
             # Check if session exists for this phone number
             if self.session_path.exists() and not force_new:
                 self.log(f"📁 Found existing session: {self.session_path.name}")
@@ -1442,12 +1508,21 @@ class UnifiedContactManager:
         """
         Start authentication process - sends code to phone
         Returns dict with status and phone_hash if successful
-        
+
         Args:
             phone_number: Phone number to authenticate
             force_new: If True, delete existing session file before starting
         """
         try:
+            # IMPORTANT: First disconnect from GlobalConnectionManager if connected
+            # This releases the session file lock so we can delete/recreate it
+            clean_phone = phone_number.replace('+', '').replace('-', '').replace(' ', '')
+            conn_manager = GlobalConnectionManager.get_instance()
+            if conn_manager.is_connected(clean_phone):
+                self.log(f"   🔌 Disconnecting from shared pool before auth...")
+                await conn_manager.disconnect_account(clean_phone)
+                self.log(f"   ✅ Disconnected from shared pool")
+
             # If force_new, delete existing session
             if force_new and self.session_path.exists():
                 self.log(f"   🗑️  Deleting existing session file for re-authentication")
@@ -1586,10 +1661,12 @@ class UnifiedContactManager:
                 'error': str(e)
             }
 
-    async def get_user_display_name(self, username: str) -> Tuple[str, str]:
+    async def get_user_display_name(self, username: str) -> Tuple[str, str, Optional[Any]]:
         """
         Scrape display name from Telegram
-        Returns: (display_name, status)
+        Returns: (display_name, status, user_entity)
+
+        The user_entity is returned for linking to inbox system.
         """
         try:
             user = await self.client.get_entity(username)
@@ -1598,20 +1675,20 @@ class UnifiedContactManager:
             display_name = f"{first_name} {last_name}".strip()
 
             if not display_name:
-                return ("Unknown", "error")
+                return ("Unknown", "error", None)
 
-            return (display_name, "success")
+            return (display_name, "success", user)
 
         except UsernameNotOccupiedError:
-            return ("", "Username doesn't exist")
+            return ("", "Username doesn't exist", None)
         except UsernameInvalidError:
-            return ("", "Invalid username format")
+            return ("", "Invalid username format", None)
         except FloodWaitError as e:
             self.log(f"⚠️  FLOOD WAIT for {e.seconds}s", level="WARNING")
             await asyncio.sleep(e.seconds)
-            return ("", f"Rate limited - retrying next contact")
+            return ("", f"Rate limited - retrying next contact", None)
         except Exception as e:
-            return ("", str(e))
+            return ("", str(e), None)
 
     async def check_existing_contacts(self) -> Tuple[Set[str], Set[str], Set[str]]:
         """
@@ -1929,8 +2006,8 @@ class UnifiedContactManager:
                 })
 
                 try:
-                    # Get display name
-                    display_name, status = await self.get_user_display_name(entry['owner'])
+                    # Get display name and user entity
+                    display_name, status, user_entity = await self.get_user_display_name(entry['owner'])
 
                     if status != "success":
                         self.log(f"❌ {status}")
@@ -1985,6 +2062,22 @@ class UnifiedContactManager:
                                 'skipped': self.stats['dev_skipped'],
                                 'failed': failed_count
                             })
+
+                            # Link to inbox system for first-reply detection
+                            if user_entity:
+                                try:
+                                    inbox_link_matrix_contact(
+                                        account_phone=self.phone_number,
+                                        peer_id=user_entity.id,
+                                        username=entry['owner'],
+                                        first_name=user_entity.first_name or "",
+                                        last_name=user_entity.last_name or "",
+                                        access_hash=user_entity.access_hash or 0,
+                                        contact_type='dev',
+                                        campaign_id=None  # Could be passed as parameter if needed
+                                    )
+                                except Exception as link_err:
+                                    self.log(f"   ⚠️ Failed to link to inbox: {str(link_err)}", level="WARNING")
                         else:
                             self.log(f"❌ Failed")
                             self.stats['dev_failed'] += 1
@@ -2299,8 +2392,8 @@ class UnifiedContactManager:
                 })
 
                 try:
-                    # Get display name
-                    display_name, status = await self.get_user_display_name(entry['telegram'])
+                    # Get display name and user entity
+                    display_name, status, user_entity = await self.get_user_display_name(entry['telegram'])
 
                     if status != "success":
                         self.log(f"❌ {status}")
@@ -2359,6 +2452,22 @@ class UnifiedContactManager:
                                 'skipped': self.stats['kol_skipped'],
                                 'failed': failed_count
                             })
+
+                            # Link to inbox system for first-reply detection
+                            if user_entity:
+                                try:
+                                    inbox_link_matrix_contact(
+                                        account_phone=self.phone_number,
+                                        peer_id=user_entity.id,
+                                        username=entry['telegram'],
+                                        first_name=user_entity.first_name or "",
+                                        last_name=user_entity.last_name or "",
+                                        access_hash=user_entity.access_hash or 0,
+                                        contact_type='kol',
+                                        campaign_id=None  # Could be passed as parameter if needed
+                                    )
+                                except Exception as link_err:
+                                    self.log(f"   ⚠️ Failed to link to inbox: {str(link_err)}", level="WARNING")
                         else:
                             self.log(f"   📝 {formatted_name}")
                             self.log(f"❌ Failed")
@@ -3302,13 +3411,14 @@ class UnifiedContactManager:
                     writer.writeheader()
                     writer.writerows(chunk)
                 
-                # Create manager and import
+                # Create manager and import (use shared connection pool)
                 account_manager = UnifiedContactManager(
                     api_id=account.get('api_id') or self.api_id,
                     api_hash=account.get('api_hash') or self.api_hash,
-                    phone_number=account_phone
+                    phone_number=account_phone,
+                    conn_manager=GlobalConnectionManager.get_instance()
                 )
-                
+
                 # Initialize client
                 clean_phone = account_phone.replace('+', '').replace('-', '').replace(' ', '')
                 if not await account_manager.init_client(account_phone, force_new=False):
@@ -3437,13 +3547,14 @@ class UnifiedContactManager:
                             'TG Usernames': entry['telegram']
                         })
                 
-                # Create manager and import
+                # Create manager and import (use shared connection pool)
                 account_manager = UnifiedContactManager(
                     api_id=account.get('api_id') or self.api_id,
                     api_hash=account.get('api_hash') or self.api_hash,
-                    phone_number=account_phone
+                    phone_number=account_phone,
+                    conn_manager=GlobalConnectionManager.get_instance()
                 )
-                
+
                 # Initialize client
                 if not await account_manager.init_client(account_phone, force_new=False):
                     self.log(f"❌ Failed to initialize client for {account_phone}", level="ERROR")
@@ -3601,10 +3712,16 @@ def get_manager() -> Optional[UnifiedContactManager]:
                 else:
                     phone_number = default_phone
 
-                # Create manager with phone number and proxy (but DON'T connect client yet)
-                # This avoids SQLite session file locking issues
-                manager = UnifiedContactManager(api_id=api_id, api_hash=api_hash, phone_number=phone_number, proxy=default_proxy)
-                logger.info("✅ Manager initialized (client will connect on-demand)" + (f" with proxy: {default_proxy}" if default_proxy else ""))
+                # Create manager with phone number, proxy, and shared connection pool
+                # Using GlobalConnectionManager prevents session file locking with inbox
+                manager = UnifiedContactManager(
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    phone_number=phone_number,
+                    proxy=default_proxy,
+                    conn_manager=GlobalConnectionManager.get_instance()
+                )
+                logger.info("✅ Manager initialized with shared connection pool" + (f" (proxy: {default_proxy})" if default_proxy else ""))
             except Exception as e:
                 logger.error(f"❌ Failed to initialize manager: {str(e)}")
                 import traceback
@@ -3613,7 +3730,7 @@ def get_manager() -> Optional[UnifiedContactManager]:
         return manager
 
 
-def get_manager_for_account(phone: str) -> Optional[UnifiedContactManager]:
+def get_manager_for_account(phone: str, use_shared_connection: bool = True) -> Optional[UnifiedContactManager]:
     """
     Create a manager instance for a specific account.
 
@@ -3622,6 +3739,9 @@ def get_manager_for_account(phone: str) -> Optional[UnifiedContactManager]:
 
     Args:
         phone: Phone number (with or without + prefix)
+        use_shared_connection: If True, uses GlobalConnectionManager for shared
+                              client pool (prevents session file locking).
+                              Set to False for authentication flows.
 
     Returns:
         UnifiedContactManager instance or None if account not found
@@ -3657,8 +3777,20 @@ def get_manager_for_account(phone: str) -> Optional[UnifiedContactManager]:
         # Format phone number with + prefix
         phone_number = f"+{clean_phone}"
 
-        # Create manager for this specific account (with proxy if configured)
-        mgr = UnifiedContactManager(api_id=api_id, api_hash=api_hash, phone_number=phone_number, proxy=account_proxy)
+        # Get GlobalConnectionManager singleton for shared client pool
+        conn_manager = None
+        if use_shared_connection:
+            conn_manager = GlobalConnectionManager.get_instance()
+            logger.info(f"🔗 Using shared connection pool for {clean_phone}")
+
+        # Create manager for this specific account (with proxy and conn_manager)
+        mgr = UnifiedContactManager(
+            api_id=api_id,
+            api_hash=api_hash,
+            phone_number=phone_number,
+            proxy=account_proxy,
+            conn_manager=conn_manager
+        )
         logger.info(f"✅ Created manager for account {clean_phone}" + (f" with proxy: {account_proxy}" if account_proxy else ""))
 
         return mgr
@@ -4088,14 +4220,17 @@ def import_devs():
             return jsonify({'error': 'csv_path required'}), 400
 
         # Get manager for specific account or default
+        # IMPORTANT: use_shared_connection=False because Flask endpoints run in request threads
+        # with their own event loops, which are different from InboxManager's background loop.
         if phone:
-            mgr = get_manager_for_account(phone)
+            mgr = get_manager_for_account(phone, use_shared_connection=False)
             if not mgr:
                 return jsonify({'error': f'Account {phone} not found or not configured'}), 404
         else:
             mgr = get_manager()
             if not mgr:
                 return jsonify({'error': 'Manager not initialized. No default account configured.'}), 500
+            mgr._conn_manager = None  # Clear to avoid loop conflicts
 
         account_phone = normalize_phone(mgr.phone_number)
 
@@ -4125,6 +4260,16 @@ def import_devs():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
+                # Disconnect from GlobalConnectionManager to release session file lock
+                clean_phone = normalize_phone(mgr.phone_number)
+                global_conn_manager = GlobalConnectionManager.get_instance()
+                if global_conn_manager.is_connected(clean_phone):
+                    logger.info(f"Disconnecting {clean_phone} from GlobalConnectionManager...")
+                    try:
+                        loop.run_until_complete(global_conn_manager.disconnect_account(clean_phone))
+                    except Exception as e:
+                        logger.warning(f"⚠️  Error disconnecting from GlobalConnectionManager: {e}")
+
                 # Initialize Telegram client BEFORE importing
                 connected = loop.run_until_complete(mgr.init_client(mgr.phone_number))
                 if not connected:
@@ -4216,14 +4361,17 @@ def import_kols():
             return jsonify({'error': 'csv_path required'}), 400
 
         # Get manager for specific account or default
+        # IMPORTANT: use_shared_connection=False because Flask endpoints run in request threads
+        # with their own event loops, which are different from InboxManager's background loop.
         if phone:
-            mgr = get_manager_for_account(phone)
+            mgr = get_manager_for_account(phone, use_shared_connection=False)
             if not mgr:
                 return jsonify({'error': f'Account {phone} not found or not configured'}), 404
         else:
             mgr = get_manager()
             if not mgr:
                 return jsonify({'error': 'Manager not initialized. No default account configured.'}), 500
+            mgr._conn_manager = None  # Clear to avoid loop conflicts
 
         account_phone = normalize_phone(mgr.phone_number)
 
@@ -4253,6 +4401,16 @@ def import_kols():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
+                # Disconnect from GlobalConnectionManager to release session file lock
+                clean_phone = normalize_phone(mgr.phone_number)
+                global_conn_manager = GlobalConnectionManager.get_instance()
+                if global_conn_manager.is_connected(clean_phone):
+                    logger.info(f"Disconnecting {clean_phone} from GlobalConnectionManager...")
+                    try:
+                        loop.run_until_complete(global_conn_manager.disconnect_account(clean_phone))
+                    except Exception as e:
+                        logger.warning(f"⚠️  Error disconnecting from GlobalConnectionManager: {e}")
+
                 # Initialize Telegram client BEFORE importing
                 connected = loop.run_until_complete(mgr.init_client(mgr.phone_number))
                 if not connected:
@@ -4345,9 +4503,12 @@ def import_devs_multi():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            # Create a manager with API credentials (used as fallback if accounts don't have their own)
+            # Create a manager with API credentials and shared connection pool
             # The multi-account method will get account-specific credentials from database
-            temp_mgr = UnifiedContactManager(api_id, api_hash, account_phones[0] if account_phones else '')
+            temp_mgr = UnifiedContactManager(
+                api_id, api_hash, account_phones[0] if account_phones else '',
+                conn_manager=GlobalConnectionManager.get_instance()
+            )
             results = loop.run_until_complete(
                 temp_mgr.import_dev_contacts_multi_account(csv_path, account_phones, dry_run=dry_run, interactive=False)
             )
@@ -4405,9 +4566,12 @@ def import_kols_multi():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            # Create a manager with API credentials (used as fallback if accounts don't have their own)
+            # Create a manager with API credentials and shared connection pool
             # The multi-account method will get account-specific credentials from database
-            temp_mgr = UnifiedContactManager(api_id, api_hash, account_phones[0] if account_phones else '')
+            temp_mgr = UnifiedContactManager(
+                api_id, api_hash, account_phones[0] if account_phones else '',
+                conn_manager=GlobalConnectionManager.get_instance()
+            )
             results = loop.run_until_complete(
                 temp_mgr.import_kol_contacts_multi_account(csv_path, account_phones, dry_run=dry_run, interactive=False)
             )
@@ -4641,7 +4805,9 @@ def _execute_multi_account_operation(operation_id: str, operation: str, phones: 
                 return None
 
             # Get manager for this account
-            mgr = get_manager_for_account(phone)
+            # IMPORTANT: use_shared_connection=False because this runs in a worker thread
+            # with its own event loop, different from InboxManager's background loop.
+            mgr = get_manager_for_account(phone, use_shared_connection=False)
             if not mgr:
                 add_account_log(operation_id, phone, f"Account not found", "error")
                 update_account_progress(operation_id, phone, 0, 0, 'error', error="Account not found")
@@ -4653,6 +4819,16 @@ def _execute_multi_account_operation(operation_id: str, operation: str, phones: 
             asyncio.set_event_loop(loop)
 
             try:
+                # Disconnect from GlobalConnectionManager to release session file lock
+                clean_phone = normalize_phone(phone)
+                global_conn_manager = GlobalConnectionManager.get_instance()
+                if global_conn_manager.is_connected(clean_phone):
+                    add_account_log(operation_id, phone, "Releasing session lock...", "info")
+                    try:
+                        loop.run_until_complete(global_conn_manager.disconnect_account(clean_phone))
+                    except Exception as e:
+                        logger.warning(f"⚠️  Error disconnecting from GlobalConnectionManager: {e}")
+
                 # Initialize client
                 add_account_log(operation_id, phone, "Connecting to Telegram...", "info")
                 connected = loop.run_until_complete(mgr.init_client(phone))
@@ -4807,14 +4983,17 @@ def scan_replies():
         phone = data.get('phone')  # Optional: specific account to use
 
         # Get manager for specific account or default
+        # IMPORTANT: use_shared_connection=False because Flask endpoints run in request threads
+        # with their own event loops, which are different from InboxManager's background loop.
         if phone:
-            mgr = get_manager_for_account(phone)
+            mgr = get_manager_for_account(phone, use_shared_connection=False)
             if not mgr:
                 return jsonify({'error': f'Account {phone} not found or not configured'}), 404
         else:
             mgr = get_manager()
             if not mgr:
                 return jsonify({'error': 'Manager not initialized. No default account configured.'}), 500
+            mgr._conn_manager = None  # Clear to avoid loop conflicts
 
         # Get the phone number for locking
         account_phone = mgr.phone_number
@@ -4845,7 +5024,17 @@ def scan_replies():
         client_to_cleanup = None
 
         try:
-            # STEP 1: Disconnect existing client to release session lock
+            # STEP 1: Disconnect from GlobalConnectionManager to release session file lock
+            clean_phone = normalize_phone(mgr.phone_number)
+            global_conn_manager = GlobalConnectionManager.get_instance()
+            if global_conn_manager.is_connected(clean_phone):
+                logger.info(f"Disconnecting {clean_phone} from GlobalConnectionManager...")
+                try:
+                    loop.run_until_complete(global_conn_manager.disconnect_account(clean_phone))
+                except Exception as e:
+                    logger.warning(f"⚠️  Error disconnecting from GlobalConnectionManager: {e}")
+
+            # Also disconnect mgr.client if it exists (legacy path)
             if mgr.client and mgr.client.is_connected():
                 logger.info("Temporarily disconnecting to release session lock...")
                 try:
@@ -5042,14 +5231,17 @@ def organize_folders():
         phone = data.get('phone')  # Optional: specific account to use
 
         # Get manager for specific account or default
+        # IMPORTANT: use_shared_connection=False because Flask endpoints run in request threads
+        # with their own event loops, which are different from InboxManager's background loop.
         if phone:
-            mgr = get_manager_for_account(phone)
+            mgr = get_manager_for_account(phone, use_shared_connection=False)
             if not mgr:
                 return jsonify({'error': f'Account {phone} not found or not configured'}), 404
         else:
             mgr = get_manager()
             if not mgr:
                 return jsonify({'error': 'Manager not initialized. No default account configured.'}), 500
+            mgr._conn_manager = None  # Clear to avoid loop conflicts
 
         update_operation_state('organize_folders', 0, 100, 'starting', f'Creating folders for {mgr.phone_number}...')
 
@@ -5057,6 +5249,16 @@ def organize_folders():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
+            # Disconnect from GlobalConnectionManager to release session file lock
+            clean_phone = normalize_phone(mgr.phone_number)
+            global_conn_manager = GlobalConnectionManager.get_instance()
+            if global_conn_manager.is_connected(clean_phone):
+                logger.info(f"Disconnecting {clean_phone} from GlobalConnectionManager...")
+                try:
+                    loop.run_until_complete(global_conn_manager.disconnect_account(clean_phone))
+                except Exception as e:
+                    logger.warning(f"⚠️  Error disconnecting: {e}")
+
             # Initialize Telegram client
             connected = loop.run_until_complete(mgr.init_client(mgr.phone_number))
             if not connected:
@@ -5113,14 +5315,19 @@ def backup_contacts():
         phone = data.get('phone')  # Optional: specific account to use
 
         # Get manager for specific account or default
+        # IMPORTANT: use_shared_connection=False because Flask endpoints run in request threads
+        # with their own event loops, which are different from InboxManager's background loop.
+        # Using shared connections would cause "asyncio event loop must not change" errors.
         if phone:
-            mgr = get_manager_for_account(phone)
+            mgr = get_manager_for_account(phone, use_shared_connection=False)
             if not mgr:
                 return jsonify({'error': f'Account {phone} not found or not configured'}), 404
         else:
             mgr = get_manager()
             if not mgr:
                 return jsonify({'error': 'Manager not initialized. No default account configured.'}), 500
+            # Clear any existing connection manager to avoid loop conflicts
+            mgr._conn_manager = None
 
         update_operation_state('backup_contacts', 0, 100, 'starting', f'Backing up contacts for {mgr.phone_number}...')
 
@@ -5129,7 +5336,18 @@ def backup_contacts():
         asyncio.set_event_loop(loop)
         client_to_cleanup = None
         try:
-            # Temporarily disconnect global client to release session file lock
+            # Disconnect from GlobalConnectionManager to release session file lock
+            # This is necessary because InboxManager may have a client connected to this account
+            clean_phone = normalize_phone(mgr.phone_number)
+            global_conn_manager = GlobalConnectionManager.get_instance()
+            if global_conn_manager.is_connected(clean_phone):
+                logger.info(f"Disconnecting {clean_phone} from GlobalConnectionManager to release session lock...")
+                try:
+                    loop.run_until_complete(global_conn_manager.disconnect_account(clean_phone))
+                except Exception as e:
+                    logger.warning(f"⚠️  Error disconnecting from GlobalConnectionManager: {e}")
+
+            # Also disconnect mgr.client if it exists (legacy path)
             if mgr.client and mgr.client.is_connected():
                 logger.info("Temporarily disconnecting to release session lock...")
                 try:
@@ -5362,10 +5580,21 @@ def trigger_auto_backup(phone: str):
                     logger.warning(f"⚠️ Auto-backup: No API credentials for {phone}")
                     return
 
-                # Create manager and run backup
-                mgr = UnifiedContactManager(api_id, api_hash, phone, proxy=proxy)
+                # Create manager WITHOUT shared connection pool
+                # (running in new thread with new event loop - can't reuse pool clients)
+                mgr = UnifiedContactManager(
+                    api_id, api_hash, phone, proxy=proxy,
+                    conn_manager=None  # Don't use shared pool in background thread
+                )
 
                 async def do_backup():
+                    # Disconnect from GlobalConnectionManager if connected (release session lock)
+                    clean_phone = phone.replace('+', '').replace('-', '').replace(' ', '')
+                    global_conn_manager = GlobalConnectionManager.get_instance()
+                    if global_conn_manager.is_connected(clean_phone):
+                        logger.info(f"Disconnecting {clean_phone} from GlobalConnectionManager for auto-backup...")
+                        await global_conn_manager.disconnect_account(clean_phone)
+
                     connected = await mgr.init_client(phone)
                     if not connected:
                         logger.warning(f"⚠️ Auto-backup: Could not connect for {phone}")
@@ -5375,8 +5604,8 @@ def trigger_auto_backup(phone: str):
                         filename, count = await mgr.export_all_contacts_backup()
                         return filename, count
                     finally:
-                        if mgr.client:
-                            await mgr.client.disconnect()
+                        # Don't disconnect - shared pool manages connections
+                        pass
 
                 filename, count = loop.run_until_complete(do_backup())
 
@@ -5846,8 +6075,33 @@ def validate_accounts_batch_endpoint():
 
 @app.route('/api/accounts/<phone>', methods=['DELETE'])
 def delete_account_endpoint(phone):
-    """Delete an account"""
+    """Delete an account and clean up session file"""
     try:
+        # Clean phone number
+        clean_phone = phone.replace('+', '').replace('-', '').replace(' ', '')
+
+        # First disconnect from GlobalConnectionManager if connected
+        conn_manager = GlobalConnectionManager.get_instance()
+        if conn_manager.is_connected(clean_phone):
+            logger.info(f"🔌 Disconnecting account {clean_phone} from shared pool...")
+            # Run async disconnect in a new event loop
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(conn_manager.disconnect_account(clean_phone))
+            finally:
+                loop.close()
+            logger.info(f"✅ Disconnected from shared pool")
+
+        # Delete session file to ensure clean state
+        session_path = SESSIONS_DIR / f"session_{clean_phone}.session"
+        if session_path.exists():
+            try:
+                session_path.unlink()
+                logger.info(f"🗑️  Deleted session file: {session_path.name}")
+            except Exception as e:
+                logger.warning(f"⚠️  Could not delete session file: {e}")
+
+        # Delete from database
         success = delete_account(phone)
         if success:
             logger.info(f"✅ Deleted account: {phone}")
@@ -5864,13 +6118,28 @@ def delete_account_endpoint(phone):
 
 @app.route('/api/accounts/<phone>/status', methods=['PUT'])
 def update_account_status_endpoint(phone):
-    """Update account status"""
+    """Update account status. When setting to 'inactive', disconnects from shared pool."""
     try:
         data = request.get_json()
         status = data.get('status')
 
         if not status:
             return jsonify({'error': 'status required'}), 400
+
+        # Clean phone number
+        clean_phone = phone.replace('+', '').replace('-', '').replace(' ', '')
+
+        # If deactivating, disconnect from GlobalConnectionManager first
+        if status in ['inactive', 'disabled', 'error']:
+            conn_manager = GlobalConnectionManager.get_instance()
+            if conn_manager.is_connected(clean_phone):
+                logger.info(f"🔌 Disconnecting account {clean_phone} (status -> {status})...")
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(conn_manager.disconnect_account(clean_phone))
+                finally:
+                    loop.close()
+                logger.info(f"✅ Disconnected from shared pool")
 
         success = update_account_status(phone, status)
         if success:
@@ -6197,6 +6466,412 @@ def serve_log_file(filepath):
 
 
 # ============================================================================
+# INBOX MANAGEMENT ENDPOINTS
+# Real-time inbox system with persistent Telegram connections
+# ============================================================================
+
+def run_inbox_coroutine(coro):
+    """Helper to run inbox manager coroutine from sync context."""
+    global inbox_manager
+    if not inbox_manager or not inbox_manager._loop:
+        raise RuntimeError("Inbox manager not started")
+
+    future = asyncio.run_coroutine_threadsafe(coro, inbox_manager._loop)
+    return future.result(timeout=60)
+
+
+# ============================================================================
+# INBOX CONNECTION ENDPOINTS
+# ============================================================================
+
+@app.route('/api/inbox/connect', methods=['POST'])
+def inbox_connect():
+    """Connect single account to inbox system."""
+    global inbox_manager
+    try:
+        data = request.get_json() or {}
+        phone = data.get('phone')
+
+        if not phone:
+            return jsonify({'error': 'Phone number required'}), 400
+
+        if not inbox_manager:
+            return jsonify({'error': 'Inbox manager not started'}), 503
+
+        success = run_inbox_coroutine(inbox_manager.connect_account(phone))
+
+        return jsonify({
+            'success': success,
+            'phone': normalize_phone(phone),
+            'message': 'Connected' if success else 'Failed to connect'
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error connecting inbox: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inbox/connect-all', methods=['POST'])
+def inbox_connect_all():
+    """Connect all active accounts to inbox system."""
+    global inbox_manager
+    try:
+        if not inbox_manager:
+            return jsonify({'error': 'Inbox manager not started'}), 503
+
+        results = run_inbox_coroutine(inbox_manager.connect_all_active_accounts())
+
+        connected = sum(1 for v in results.values() if v)
+        total = len(results)
+
+        return jsonify({
+            'success': True,
+            'connected': connected,
+            'total': total,
+            'results': results
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error connecting all inbox: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inbox/disconnect', methods=['POST'])
+def inbox_disconnect():
+    """Disconnect account from inbox system."""
+    global inbox_manager
+    try:
+        data = request.get_json() or {}
+        phone = data.get('phone')
+
+        if not phone:
+            return jsonify({'error': 'Phone number required'}), 400
+
+        if not inbox_manager:
+            return jsonify({'error': 'Inbox manager not started'}), 503
+
+        run_inbox_coroutine(inbox_manager.disconnect_account(phone))
+
+        return jsonify({
+            'success': True,
+            'phone': normalize_phone(phone),
+            'message': 'Disconnected'
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error disconnecting inbox: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inbox/connection-status', methods=['GET'])
+def inbox_connection_status():
+    """Get connection states for all accounts."""
+    global inbox_manager
+    try:
+        states = inbox_get_connection_states()
+
+        # Add connected accounts from GlobalConnectionManager if inbox_manager is running
+        connected_phones = []
+        if inbox_manager and inbox_manager._conn_manager:
+            connected_phones = inbox_manager._conn_manager.get_connected_accounts()
+
+        return jsonify({
+            'success': True,
+            'states': states,
+            'connected_accounts': connected_phones,
+            'inbox_manager_running': inbox_manager is not None and inbox_manager._running
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting connection status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# INBOX CONVERSATION ENDPOINTS
+# ============================================================================
+
+@app.route('/api/inbox/<phone>/conversations', methods=['GET'])
+def inbox_conversations(phone):
+    """Get conversations for account."""
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        offset = request.args.get('offset', 0, type=int)
+        unread_only = request.args.get('unread_only', 'false').lower() == 'true'
+        matrix_only = request.args.get('matrix_only', 'false').lower() == 'true'
+
+        conversations = inbox_get_conversations(
+            phone, limit, offset, unread_only, matrix_only
+        )
+
+        return jsonify({
+            'success': True,
+            'conversations': conversations,
+            'count': len(conversations),
+            'limit': limit,
+            'offset': offset
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting conversations: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inbox/<phone>/conversations/<int:peer_id>', methods=['GET'])
+def inbox_conversation_detail(phone, peer_id):
+    """Get single conversation details."""
+    try:
+        conv = inbox_get_or_create_conversation(phone, peer_id)
+
+        if not conv:
+            return jsonify({'error': 'Conversation not found'}), 404
+
+        return jsonify({
+            'success': True,
+            'conversation': conv
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting conversation: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inbox/<phone>/conversations/<int:peer_id>/messages', methods=['GET'])
+def inbox_messages(phone, peer_id):
+    """Get messages for conversation."""
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        before_msg_id = request.args.get('before_msg_id', type=int)
+
+        messages = inbox_get_messages(phone, peer_id, limit, before_msg_id)
+
+        return jsonify({
+            'success': True,
+            'messages': messages,
+            'count': len(messages),
+            'peer_id': peer_id
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting messages: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# INBOX SEND MESSAGE ENDPOINT
+# ============================================================================
+
+@app.route('/api/inbox/<phone>/send', methods=['POST'])
+def inbox_send_message(phone):
+    """Send message (rate limited)."""
+    global inbox_manager
+    try:
+        data = request.get_json() or {}
+        peer_id = data.get('peer_id')
+        text = data.get('text', '').strip()
+        campaign_id = data.get('campaign_id')
+
+        if not peer_id:
+            return jsonify({'error': 'peer_id required'}), 400
+        if not text:
+            return jsonify({'error': 'text required'}), 400
+
+        if not inbox_manager:
+            return jsonify({'error': 'Inbox manager not started'}), 503
+
+        result = run_inbox_coroutine(
+            inbox_manager.send_message(phone, peer_id, text, campaign_id)
+        )
+
+        if result.get('success'):
+            return jsonify(result)
+        else:
+            return jsonify(result), 429 if 'limit' in result.get('error', '').lower() else 400
+
+    except Exception as e:
+        logger.error(f"❌ Error sending message: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inbox/<phone>/rate-limit', methods=['GET'])
+def inbox_rate_limit_status(phone):
+    """Get rate limit status for account."""
+    global inbox_manager
+    try:
+        if inbox_manager:
+            status = inbox_manager.get_rate_limit_status(phone)
+        else:
+            # Return default status if manager not running
+            from inbox_manager import DMRateLimiter
+            limiter = DMRateLimiter(phone)
+            status = limiter.get_status()
+
+        return jsonify({
+            'success': True,
+            **status
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting rate limit: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# INBOX SYNC ENDPOINTS
+# ============================================================================
+
+@app.route('/api/inbox/<phone>/sync/dialogs', methods=['POST'])
+def inbox_sync_dialogs(phone):
+    """Trigger dialog sync for account."""
+    global inbox_manager
+    try:
+        if not inbox_manager:
+            return jsonify({'error': 'Inbox manager not started'}), 503
+
+        result = run_inbox_coroutine(inbox_manager.trigger_dialog_sync(phone))
+
+        return jsonify({
+            'success': True,
+            'dialogs_fetched': result.dialogs_fetched,
+            'synced': result.synced,
+            'skipped': result.skipped,
+            'gaps_detected': result.gaps_detected,
+            'errors': result.errors
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error syncing dialogs: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inbox/<phone>/sync/full', methods=['POST'])
+def inbox_sync_full(phone):
+    """Trigger full sync for account."""
+    global inbox_manager
+    try:
+        if not inbox_manager:
+            return jsonify({'error': 'Inbox manager not started'}), 503
+
+        result = run_inbox_coroutine(inbox_manager.trigger_full_sync(phone))
+
+        return jsonify({
+            'success': True,
+            'dialogs_synced': result.dialogs_synced,
+            'messages_backfilled': result.messages_backfilled,
+            'integrity_ok': result.integrity_ok,
+            'errors': result.errors
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error full sync: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# INBOX METRICS ENDPOINTS
+# ============================================================================
+
+@app.route('/api/inbox/metrics', methods=['GET'])
+def inbox_metrics():
+    """Get inbox metrics."""
+    try:
+        phone = request.args.get('phone')
+        campaign_id = request.args.get('campaign_id')
+
+        # Get campaign metrics
+        campaigns = inbox_get_campaign_metrics(campaign_id)
+
+        # Get connection states
+        connection_states = inbox_get_connection_states()
+
+        # Calculate totals
+        total_messages = 0
+        total_conversations = 0
+        for state in connection_states:
+            total_messages += state.get('messages_count', 0) or 0
+            total_conversations += state.get('dialogs_count', 0) or 0
+
+        return jsonify({
+            'success': True,
+            'campaigns': campaigns,
+            'connection_states': connection_states,
+            'totals': {
+                'messages': total_messages,
+                'conversations': total_conversations,
+                'connected_accounts': len([s for s in connection_states if s.get('is_connected')])
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting metrics: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inbox/campaigns/<campaign_id>/metrics', methods=['GET'])
+def inbox_campaign_metrics(campaign_id):
+    """Get metrics for specific campaign."""
+    try:
+        # Recalculate metrics
+        inbox_update_campaign_metrics(campaign_id)
+
+        # Get updated metrics
+        metrics = inbox_get_campaign_metrics(campaign_id)
+
+        if not metrics:
+            return jsonify({'error': 'Campaign not found'}), 404
+
+        return jsonify({
+            'success': True,
+            'campaign': metrics[0] if metrics else None
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting campaign metrics: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# INBOX WEBSOCKET HANDLERS
+# ============================================================================
+
+@socketio.on('inbox:subscribe')
+def handle_inbox_subscribe(data):
+    """Subscribe to inbox events for an account."""
+    phone = data.get('phone')
+    if phone:
+        clean_phone = normalize_phone(phone)
+        join_room(f"inbox:{clean_phone}")
+        emit('inbox:subscribed', {'phone': clean_phone, 'success': True})
+        logger.debug(f"📬 Client subscribed to inbox:{clean_phone}")
+
+
+@socketio.on('inbox:unsubscribe')
+def handle_inbox_unsubscribe(data):
+    """Unsubscribe from inbox events."""
+    phone = data.get('phone')
+    if phone:
+        clean_phone = normalize_phone(phone)
+        leave_room(f"inbox:{clean_phone}")
+        emit('inbox:unsubscribed', {'phone': clean_phone})
+        logger.debug(f"📭 Client unsubscribed from inbox:{clean_phone}")
+
+
+@socketio.on('inbox:subscribe_all')
+def handle_inbox_subscribe_all():
+    """Subscribe to all connected accounts."""
+    global inbox_manager
+    subscribed = []
+
+    if inbox_manager and inbox_manager._conn_manager:
+        for phone in inbox_manager._conn_manager.get_connected_accounts():
+            join_room(f"inbox:{phone}")
+            subscribed.append(phone)
+
+    emit('inbox:subscribed_all', {'phones': subscribed, 'count': len(subscribed)})
+    logger.debug(f"📬 Client subscribed to {len(subscribed)} inbox rooms")
+
+
+# ============================================================================
 # ERROR HANDLERS
 # ============================================================================
 
@@ -6218,6 +6893,9 @@ def log_request():
 
 
 if __name__ == '__main__':
+    import atexit
+    import signal
+
     logger.info("🚀 Starting MATRIX API Server on http://localhost:5000")
     logger.info("📱 React Native frontend should connect to this server")
     logger.info("🔌 WebSocket server enabled for real-time progress updates")
@@ -6235,6 +6913,104 @@ if __name__ == '__main__':
         logger.info("✅ Operations tables ready")
     except Exception as e:
         logger.warning(f"⚠️  Could not initialize operations tables: {str(e)}")
+
+    # Initialize inbox tables for real-time message management
+    try:
+        init_inbox_tables()
+        logger.info("✅ Inbox tables ready")
+    except Exception as e:
+        logger.warning(f"⚠️  Could not initialize inbox tables: {str(e)}")
+
+    # ========================================================================
+    # Initialize GlobalConnectionManager FIRST (shared TelegramClient pool)
+    # This MUST be done before InboxManager so both systems use the same pool
+    # ========================================================================
+    logger.info("🔧 Initializing GlobalConnectionManager (shared connection pool)...")
+    global_conn_manager = GlobalConnectionManager.get_instance(socketio)
+    logger.info("✅ GlobalConnectionManager initialized - all components will share connections")
+
+    # Initialize and start inbox manager (persistent Telegram connections)
+    # Use a list to allow modification from nested function (avoids nonlocal issues)
+    inbox_loop_ref = [None]
+
+    try:
+        # Pass the GlobalConnectionManager to InboxManager
+        inbox_manager = InboxManager(socketio, conn_manager=global_conn_manager)
+
+        def start_inbox_manager():
+            """Start inbox manager in its own asyncio event loop."""
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            inbox_loop_ref[0] = loop  # Store reference for graceful shutdown
+
+            # Set the event loop on GlobalConnectionManager
+            global_conn_manager.set_loop(loop)
+
+            # Start the manager
+            loop.run_until_complete(inbox_manager.start())
+
+            # Auto-connect all active accounts
+            logger.info("📱 Auto-connecting all active accounts to inbox...")
+            loop.run_until_complete(inbox_manager.connect_all_active_accounts())
+
+            # Run forever to keep event handlers active
+            try:
+                loop.run_forever()
+            except Exception as e:
+                logger.error(f"❌ Inbox manager loop error: {e}")
+            finally:
+                loop.run_until_complete(inbox_manager.stop())
+                loop.close()
+
+        inbox_manager_thread = threading.Thread(
+            target=start_inbox_manager,
+            daemon=True,
+            name="inbox_manager"
+        )
+        inbox_manager_thread.start()
+        logger.info("✅ Inbox manager started - auto-connecting accounts in background")
+        logger.info("🔗 Operations will now share connections with inbox (no more file locking!)")
+
+    except Exception as e:
+        logger.warning(f"⚠️  Could not start inbox manager: {str(e)}")
+        inbox_manager = None
+        inbox_manager_thread = None
+
+    # Graceful shutdown handler
+    def graceful_shutdown(signum=None, frame=None):
+        """Handle graceful shutdown of inbox manager and connections."""
+        logger.info("🛑 Received shutdown signal, cleaning up...")
+
+        inbox_loop = inbox_loop_ref[0]
+
+        if inbox_manager is not None and inbox_loop is not None:
+            try:
+                # Schedule stop() coroutine in the inbox manager's event loop
+                future = asyncio.run_coroutine_threadsafe(
+                    inbox_manager.stop(),
+                    inbox_loop
+                )
+                # Wait up to 10 seconds for cleanup
+                future.result(timeout=10)
+                logger.info("✅ Inbox manager stopped gracefully")
+            except Exception as e:
+                logger.warning(f"⚠️ Error during inbox manager shutdown: {e}")
+
+        # Stop the inbox manager's event loop
+        if inbox_loop is not None and inbox_loop.is_running():
+            inbox_loop.call_soon_threadsafe(inbox_loop.stop)
+
+        logger.info("✅ Graceful shutdown complete")
+
+    # Register shutdown handlers
+    atexit.register(graceful_shutdown)
+
+    # Handle SIGINT (Ctrl+C) and SIGTERM
+    try:
+        signal.signal(signal.SIGINT, graceful_shutdown)
+        signal.signal(signal.SIGTERM, graceful_shutdown)
+    except Exception as e:
+        logger.debug(f"Could not register signal handlers: {e}")
 
     # Start background DB flush worker thread
     _start_db_flush_thread()

@@ -1033,3 +1033,1137 @@ def db_update_operation_status(operation_id: str, status: str) -> bool:
     except Exception as e:
         logger.error(f"❌ Error updating operation status: {str(e)}")
         return False
+
+
+# ============================================================================
+# INBOX MANAGEMENT TABLES
+# Real-time message inbox system with persistent connections
+# ============================================================================
+
+def init_inbox_tables():
+    """
+    Initialize inbox management tables for real-time message tracking.
+
+    Tables created:
+    - inbox_conversations: Track all private chats per account
+    - inbox_messages: Full message history
+    - inbox_events: Event log for notifications and audit
+    - inbox_campaigns: Track outreach campaigns for metrics
+    - inbox_connection_state: Track connection status per account
+    - inbox_dm_history: Track sent DMs for duplicate detection & rate limiting
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # ============================================================================
+        # CONVERSATIONS: Track all private chats per account
+        # ============================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inbox_conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_phone TEXT NOT NULL,
+                peer_id INTEGER NOT NULL,
+
+                -- Peer info (cached)
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                peer_phone TEXT,
+                access_hash INTEGER,
+
+                -- MATRIX contact integration
+                is_matrix_contact BOOLEAN DEFAULT FALSE,
+                contact_type TEXT,                        -- 'dev', 'kol', NULL
+                contact_status TEXT,                      -- 'blue', 'yellow', NULL
+                campaign_id TEXT,
+
+                -- Last message state (for gap detection)
+                last_msg_id INTEGER DEFAULT 0,
+                last_msg_date TIMESTAMP,
+                last_msg_text TEXT,
+                last_msg_from_id INTEGER,
+                last_msg_is_outgoing BOOLEAN,
+
+                -- Read state
+                our_last_read_msg_id INTEGER DEFAULT 0,
+                their_last_read_msg_id INTEGER DEFAULT 0,
+                unread_count INTEGER DEFAULT 0,
+
+                -- Sync metadata
+                last_sync TIMESTAMP,
+                needs_backfill BOOLEAN DEFAULT FALSE,
+                backfill_from_msg_id INTEGER,
+
+                -- Flags
+                is_archived BOOLEAN DEFAULT FALSE,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                UNIQUE(account_phone, peer_id)
+            )
+        ''')
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_conv_account ON inbox_conversations(account_phone)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_conv_matrix ON inbox_conversations(is_matrix_contact)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_conv_campaign ON inbox_conversations(campaign_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_conv_unread ON inbox_conversations(account_phone, unread_count)')
+
+        # ============================================================================
+        # MESSAGES: Full message history
+        # ============================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inbox_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_phone TEXT NOT NULL,
+                peer_id INTEGER NOT NULL,
+                msg_id INTEGER NOT NULL,
+
+                -- Message content
+                from_id INTEGER NOT NULL,
+                is_outgoing BOOLEAN NOT NULL,
+                text TEXT,
+                date TIMESTAMP NOT NULL,
+
+                -- Reply context
+                reply_to_msg_id INTEGER,
+
+                -- Media
+                media_type TEXT,                          -- 'photo', 'document', 'video', etc.
+                media_file_id TEXT,
+
+                -- Edit/delete tracking
+                edit_date TIMESTAMP,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                deleted_at TIMESTAMP,
+
+                -- Read status (outgoing only)
+                is_read BOOLEAN DEFAULT FALSE,
+                read_at TIMESTAMP,
+
+                -- Sync metadata
+                synced_via TEXT,                          -- 'event', 'dialog', 'backfill'
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                UNIQUE(account_phone, peer_id, msg_id)
+            )
+        ''')
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_msg_conv ON inbox_messages(account_phone, peer_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_msg_date ON inbox_messages(account_phone, peer_id, date DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_msg_outgoing ON inbox_messages(account_phone, is_outgoing, is_read)')
+
+        # ============================================================================
+        # EVENTS: Event log for notifications and audit
+        # ============================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inbox_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_phone TEXT NOT NULL,
+                peer_id INTEGER NOT NULL,
+
+                event_type TEXT NOT NULL,                 -- 'new_message', 'message_read', 'first_reply', etc.
+                event_data TEXT,                          -- JSON string
+                msg_id INTEGER,
+                campaign_id TEXT,
+
+                notified BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_events_type ON inbox_events(event_type)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_inbox_events_account ON inbox_events(account_phone, created_at DESC)')
+
+        # ============================================================================
+        # CAMPAIGNS: Track outreach campaigns for metrics
+        # ============================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inbox_campaigns (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                contact_type TEXT,                        -- 'dev', 'kol', 'mixed'
+
+                total_contacts INTEGER DEFAULT 0,
+                total_reached INTEGER DEFAULT 0,
+                total_replies INTEGER DEFAULT 0,
+                total_read INTEGER DEFAULT 0,
+
+                reply_rate REAL DEFAULT 0,
+                read_rate REAL DEFAULT 0,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # ============================================================================
+        # CONNECTION_STATE: Track connection status per account
+        # ============================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inbox_connection_state (
+                account_phone TEXT PRIMARY KEY,
+
+                is_connected BOOLEAN DEFAULT FALSE,
+                connected_at TIMESTAMP,
+                last_disconnect_at TIMESTAMP,
+                reconnect_attempts INTEGER DEFAULT 0,
+
+                last_dialog_sync TIMESTAMP,
+                last_full_sync TIMESTAMP,
+                dialogs_count INTEGER DEFAULT 0,
+                messages_count INTEGER DEFAULT 0,
+
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # ============================================================================
+        # DM_HISTORY: Track sent DMs for duplicate detection & rate limiting
+        # ============================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inbox_dm_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_phone TEXT NOT NULL,
+                peer_id INTEGER NOT NULL,
+                campaign_id TEXT,
+
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                msg_id INTEGER,
+
+                UNIQUE(account_phone, peer_id, campaign_id)
+            )
+        ''')
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dm_history_account ON inbox_dm_history(account_phone)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dm_history_sent ON inbox_dm_history(account_phone, sent_at DESC)')
+
+        conn.commit()
+        conn.close()
+        logger.info("✅ Inbox tables initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error initializing inbox tables: {str(e)}")
+        return False
+
+
+# ============================================================================
+# INBOX CONVERSATION CRUD FUNCTIONS
+# ============================================================================
+
+def inbox_get_or_create_conversation(account_phone: str, peer_id: int,
+                                      username: str = None, first_name: str = None,
+                                      last_name: str = None, access_hash: int = None) -> Optional[Dict]:
+    """
+    Get existing conversation or create a new one.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+        username: Optional username
+        first_name: Optional first name
+        last_name: Optional last name
+        access_hash: Optional access hash for the user
+
+    Returns:
+        Conversation dict or None on error
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Try to get existing
+        cursor.execute('''
+            SELECT * FROM inbox_conversations
+            WHERE account_phone = ? AND peer_id = ?
+        ''', (clean_phone, peer_id))
+        row = cursor.fetchone()
+
+        if row:
+            # Update peer info if provided
+            if username or first_name or last_name:
+                cursor.execute('''
+                    UPDATE inbox_conversations
+                    SET username = COALESCE(?, username),
+                        first_name = COALESCE(?, first_name),
+                        last_name = COALESCE(?, last_name),
+                        access_hash = COALESCE(?, access_hash),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE account_phone = ? AND peer_id = ?
+                ''', (username, first_name, last_name, access_hash, clean_phone, peer_id))
+                conn.commit()
+                # Re-fetch updated row
+                cursor.execute('SELECT * FROM inbox_conversations WHERE account_phone = ? AND peer_id = ?',
+                             (clean_phone, peer_id))
+                row = cursor.fetchone()
+            conn.close()
+            return dict(row)
+
+        # Create new conversation
+        cursor.execute('''
+            INSERT INTO inbox_conversations
+            (account_phone, peer_id, username, first_name, last_name, access_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (clean_phone, peer_id, username, first_name, last_name, access_hash))
+        conv_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute('SELECT * FROM inbox_conversations WHERE id = ?', (conv_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    except Exception as e:
+        logger.error(f"❌ Error get/create conversation: {str(e)}")
+        return None
+
+
+def inbox_update_conversation(account_phone: str, peer_id: int, **updates) -> bool:
+    """
+    Update conversation fields.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+        **updates: Fields to update (last_msg_id, last_msg_text, unread_count, etc.)
+
+    Returns:
+        True if updated, False otherwise
+    """
+    try:
+        if not updates:
+            return True
+
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Build SET clause
+        set_parts = []
+        values = []
+        for key, value in updates.items():
+            set_parts.append(f"{key} = ?")
+            values.append(value)
+        set_parts.append("updated_at = CURRENT_TIMESTAMP")
+
+        values.extend([clean_phone, peer_id])
+
+        cursor.execute(f'''
+            UPDATE inbox_conversations
+            SET {", ".join(set_parts)}
+            WHERE account_phone = ? AND peer_id = ?
+        ''', values)
+
+        conn.commit()
+        updated = cursor.rowcount > 0
+        conn.close()
+        return updated
+
+    except Exception as e:
+        logger.error(f"❌ Error updating conversation: {str(e)}")
+        return False
+
+
+def inbox_get_conversations(account_phone: str, limit: int = 50, offset: int = 0,
+                            unread_only: bool = False, matrix_only: bool = False) -> List[Dict]:
+    """
+    Get conversations for an account.
+
+    Args:
+        account_phone: Account phone number
+        limit: Maximum conversations to return
+        offset: Offset for pagination
+        unread_only: Only return conversations with unread messages
+        matrix_only: Only return MATRIX-tagged contacts
+
+    Returns:
+        List of conversation dicts
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        where_parts = ["account_phone = ?"]
+        params = [clean_phone]
+
+        if unread_only:
+            where_parts.append("unread_count > 0")
+        if matrix_only:
+            where_parts.append("is_matrix_contact = TRUE")
+
+        query = f'''
+            SELECT * FROM inbox_conversations
+            WHERE {" AND ".join(where_parts)}
+            ORDER BY last_msg_date DESC NULLS LAST
+            LIMIT ? OFFSET ?
+        '''
+        params.extend([limit, offset])
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [dict(row) for row in rows]
+
+    except Exception as e:
+        logger.error(f"❌ Error getting conversations: {str(e)}")
+        return []
+
+
+# ============================================================================
+# INBOX MESSAGE CRUD FUNCTIONS
+# ============================================================================
+
+def inbox_insert_message(account_phone: str, peer_id: int, msg_id: int,
+                         from_id: int, is_outgoing: bool, text: str,
+                         date: datetime, reply_to_msg_id: int = None,
+                         media_type: str = None, synced_via: str = 'event') -> bool:
+    """
+    Insert a new message (or ignore if duplicate).
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID (conversation partner)
+        msg_id: Telegram message ID
+        from_id: Sender's user ID
+        is_outgoing: True if we sent it
+        text: Message text
+        date: Message timestamp
+        reply_to_msg_id: Optional reply-to message ID
+        media_type: Optional media type
+        synced_via: How this message was synced ('event', 'dialog', 'backfill')
+
+    Returns:
+        True if inserted, False if duplicate or error
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT OR IGNORE INTO inbox_messages
+            (account_phone, peer_id, msg_id, from_id, is_outgoing, text, date,
+             reply_to_msg_id, media_type, synced_via)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (clean_phone, peer_id, msg_id, from_id, is_outgoing, text, date,
+              reply_to_msg_id, media_type, synced_via))
+
+        inserted = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return inserted
+
+    except Exception as e:
+        logger.error(f"❌ Error inserting message: {str(e)}")
+        return False
+
+
+def inbox_get_messages(account_phone: str, peer_id: int, limit: int = 50,
+                       before_msg_id: int = None) -> List[Dict]:
+    """
+    Get messages for a conversation.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+        limit: Maximum messages to return
+        before_msg_id: Get messages older than this ID (for pagination)
+
+    Returns:
+        List of message dicts (oldest first)
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if before_msg_id:
+            cursor.execute('''
+                SELECT * FROM inbox_messages
+                WHERE account_phone = ? AND peer_id = ? AND msg_id < ?
+                ORDER BY msg_id DESC
+                LIMIT ?
+            ''', (clean_phone, peer_id, before_msg_id, limit))
+        else:
+            cursor.execute('''
+                SELECT * FROM inbox_messages
+                WHERE account_phone = ? AND peer_id = ?
+                ORDER BY msg_id DESC
+                LIMIT ?
+            ''', (clean_phone, peer_id, limit))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        # Return oldest first
+        messages = [dict(row) for row in rows]
+        messages.reverse()
+        return messages
+
+    except Exception as e:
+        logger.error(f"❌ Error getting messages: {str(e)}")
+        return []
+
+
+def inbox_mark_messages_read(account_phone: str, peer_id: int, max_msg_id: int) -> int:
+    """
+    Mark outgoing messages as read up to max_msg_id.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+        max_msg_id: Mark all messages with ID <= this as read
+
+    Returns:
+        Number of messages marked as read
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE inbox_messages
+            SET is_read = TRUE, read_at = CURRENT_TIMESTAMP
+            WHERE account_phone = ? AND peer_id = ? AND is_outgoing = TRUE
+              AND msg_id <= ? AND is_read = FALSE
+        ''', (clean_phone, peer_id, max_msg_id))
+
+        read_count = cursor.rowcount
+
+        # Also update conversation
+        cursor.execute('''
+            UPDATE inbox_conversations
+            SET their_last_read_msg_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE account_phone = ? AND peer_id = ?
+        ''', (max_msg_id, clean_phone, peer_id))
+
+        conn.commit()
+        conn.close()
+        return read_count
+
+    except Exception as e:
+        logger.error(f"❌ Error marking messages read: {str(e)}")
+        return 0
+
+
+def inbox_soft_delete_messages(account_phone: str, peer_id: int, msg_ids: List[int]) -> int:
+    """
+    Soft-delete messages (mark is_deleted=TRUE).
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+        msg_ids: List of message IDs to delete
+
+    Returns:
+        Number of messages deleted
+    """
+    try:
+        if not msg_ids:
+            return 0
+
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        placeholders = ','.join('?' * len(msg_ids))
+        params = [clean_phone, peer_id] + msg_ids
+
+        cursor.execute(f'''
+            UPDATE inbox_messages
+            SET is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP,
+                text = '[Message deleted]'
+            WHERE account_phone = ? AND peer_id = ? AND msg_id IN ({placeholders})
+        ''', params)
+
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return deleted_count
+
+    except Exception as e:
+        logger.error(f"❌ Error soft-deleting messages: {str(e)}")
+        return 0
+
+
+# ============================================================================
+# INBOX CONNECTION STATE FUNCTIONS
+# ============================================================================
+
+def inbox_update_connection_state(account_phone: str, is_connected: bool,
+                                   **extra_fields) -> bool:
+    """
+    Update connection state for an account.
+
+    Args:
+        account_phone: Account phone number
+        is_connected: Connection status
+        **extra_fields: Additional fields (dialogs_count, messages_count, etc.)
+
+    Returns:
+        True if updated
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Upsert
+        cursor.execute('''
+            INSERT INTO inbox_connection_state (account_phone, is_connected, connected_at, updated_at)
+            VALUES (?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END, CURRENT_TIMESTAMP)
+            ON CONFLICT(account_phone) DO UPDATE SET
+                is_connected = excluded.is_connected,
+                connected_at = CASE WHEN excluded.is_connected AND NOT is_connected THEN CURRENT_TIMESTAMP ELSE connected_at END,
+                last_disconnect_at = CASE WHEN NOT excluded.is_connected AND is_connected THEN CURRENT_TIMESTAMP ELSE last_disconnect_at END,
+                reconnect_attempts = CASE WHEN excluded.is_connected THEN 0 ELSE reconnect_attempts END,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (clean_phone, is_connected, is_connected))
+
+        # Apply extra fields if provided
+        if extra_fields:
+            set_parts = []
+            values = []
+            for key, value in extra_fields.items():
+                set_parts.append(f"{key} = ?")
+                values.append(value)
+            values.append(clean_phone)
+
+            cursor.execute(f'''
+                UPDATE inbox_connection_state
+                SET {", ".join(set_parts)}, updated_at = CURRENT_TIMESTAMP
+                WHERE account_phone = ?
+            ''', values)
+
+        conn.commit()
+        conn.close()
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error updating connection state: {str(e)}")
+        return False
+
+
+def inbox_get_connection_states() -> List[Dict]:
+    """Get connection states for all accounts."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('SELECT * FROM inbox_connection_state ORDER BY account_phone')
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [dict(row) for row in rows]
+
+    except Exception as e:
+        logger.error(f"❌ Error getting connection states: {str(e)}")
+        return []
+
+
+def inbox_increment_reconnect_attempts(account_phone: str) -> int:
+    """Increment reconnect attempts counter and return new value."""
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE inbox_connection_state
+            SET reconnect_attempts = reconnect_attempts + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE account_phone = ?
+        ''', (clean_phone,))
+
+        cursor.execute('SELECT reconnect_attempts FROM inbox_connection_state WHERE account_phone = ?',
+                      (clean_phone,))
+        row = cursor.fetchone()
+        conn.commit()
+        conn.close()
+
+        return row['reconnect_attempts'] if row else 1
+
+    except Exception as e:
+        logger.error(f"❌ Error incrementing reconnect attempts: {str(e)}")
+        return 0
+
+
+# ============================================================================
+# INBOX DM HISTORY FUNCTIONS (for rate limiting)
+# ============================================================================
+
+def inbox_record_dm_sent(account_phone: str, peer_id: int, msg_id: int = None,
+                         campaign_id: str = None) -> bool:
+    """
+    Record a sent DM for duplicate detection and rate limiting.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Recipient's user ID
+        msg_id: Optional message ID
+        campaign_id: Optional campaign ID
+
+    Returns:
+        True if recorded (False if duplicate)
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT OR IGNORE INTO inbox_dm_history
+            (account_phone, peer_id, campaign_id, msg_id)
+            VALUES (?, ?, ?, ?)
+        ''', (clean_phone, peer_id, campaign_id, msg_id))
+
+        inserted = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return inserted
+
+    except Exception as e:
+        logger.error(f"❌ Error recording DM: {str(e)}")
+        return False
+
+
+def inbox_check_dm_sent(account_phone: str, peer_id: int, campaign_id: str = None) -> bool:
+    """
+    Check if we already sent a DM to this user (for this campaign).
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Recipient's user ID
+        campaign_id: Optional campaign ID (if None, checks any campaign)
+
+    Returns:
+        True if DM was already sent
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if campaign_id:
+            cursor.execute('''
+                SELECT 1 FROM inbox_dm_history
+                WHERE account_phone = ? AND peer_id = ? AND campaign_id = ?
+            ''', (clean_phone, peer_id, campaign_id))
+        else:
+            cursor.execute('''
+                SELECT 1 FROM inbox_dm_history
+                WHERE account_phone = ? AND peer_id = ?
+            ''', (clean_phone, peer_id))
+
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
+
+    except Exception as e:
+        logger.error(f"❌ Error checking DM history: {str(e)}")
+        return False
+
+
+def inbox_get_dm_count_today(account_phone: str) -> int:
+    """
+    Get count of DMs sent today by this account (for rate limiting).
+
+    Args:
+        account_phone: Account phone number
+
+    Returns:
+        Number of DMs sent today
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT COUNT(*) as count FROM inbox_dm_history
+            WHERE account_phone = ? AND sent_at >= date('now', 'start of day')
+        ''', (clean_phone,))
+
+        row = cursor.fetchone()
+        conn.close()
+        return row['count'] if row else 0
+
+    except Exception as e:
+        logger.error(f"❌ Error getting DM count: {str(e)}")
+        return 0
+
+
+# ============================================================================
+# INBOX CAMPAIGNS FUNCTIONS
+# ============================================================================
+
+def inbox_ensure_campaign(campaign_id: str, name: str = None,
+                          contact_type: str = None) -> bool:
+    """
+    Create campaign if it doesn't exist.
+
+    Args:
+        campaign_id: Unique campaign ID
+        name: Campaign name (defaults to campaign_id)
+        contact_type: Type of contacts ('dev', 'kol', 'mixed')
+
+    Returns:
+        True if created or already exists
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT OR IGNORE INTO inbox_campaigns (id, name, contact_type)
+            VALUES (?, ?, ?)
+        ''', (campaign_id, name or campaign_id, contact_type))
+
+        conn.commit()
+        conn.close()
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error ensuring campaign: {str(e)}")
+        return False
+
+
+def inbox_update_campaign_metrics(campaign_id: str) -> bool:
+    """
+    Recalculate campaign metrics from conversations.
+
+    Args:
+        campaign_id: Campaign ID to update
+
+    Returns:
+        True if updated
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Count metrics from conversations
+        cursor.execute('''
+            SELECT
+                COUNT(*) as total_contacts,
+                SUM(CASE WHEN last_msg_is_outgoing = TRUE THEN 1 ELSE 0 END) as total_reached,
+                SUM(CASE WHEN contact_status = 'yellow' THEN 1 ELSE 0 END) as total_replies,
+                SUM(CASE WHEN their_last_read_msg_id > 0 THEN 1 ELSE 0 END) as total_read
+            FROM inbox_conversations
+            WHERE campaign_id = ? AND is_matrix_contact = TRUE
+        ''', (campaign_id,))
+
+        row = cursor.fetchone()
+        if row:
+            total_contacts = row['total_contacts'] or 0
+            total_reached = row['total_reached'] or 0
+            total_replies = row['total_replies'] or 0
+            total_read = row['total_read'] or 0
+
+            reply_rate = (total_replies / total_reached * 100) if total_reached > 0 else 0
+            read_rate = (total_read / total_reached * 100) if total_reached > 0 else 0
+
+            cursor.execute('''
+                UPDATE inbox_campaigns
+                SET total_contacts = ?, total_reached = ?, total_replies = ?,
+                    total_read = ?, reply_rate = ?, read_rate = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (total_contacts, total_reached, total_replies, total_read,
+                  reply_rate, read_rate, campaign_id))
+
+        conn.commit()
+        conn.close()
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error updating campaign metrics: {str(e)}")
+        return False
+
+
+def inbox_get_campaign_metrics(campaign_id: str = None) -> List[Dict]:
+    """
+    Get campaign metrics.
+
+    Args:
+        campaign_id: Optional specific campaign (None for all)
+
+    Returns:
+        List of campaign metric dicts
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if campaign_id:
+            cursor.execute('SELECT * FROM inbox_campaigns WHERE id = ?', (campaign_id,))
+        else:
+            cursor.execute('SELECT * FROM inbox_campaigns ORDER BY created_at DESC')
+
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    except Exception as e:
+        logger.error(f"❌ Error getting campaign metrics: {str(e)}")
+        return []
+
+
+# ============================================================================
+# INBOX EVENT LOG FUNCTIONS
+# ============================================================================
+
+def inbox_log_event(account_phone: str, peer_id: int, event_type: str,
+                    event_data: Dict = None, msg_id: int = None,
+                    campaign_id: str = None) -> bool:
+    """
+    Log an inbox event.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Related user ID
+        event_type: Type of event ('new_message', 'message_read', 'first_reply', etc.)
+        event_data: Optional JSON-serializable event data
+        msg_id: Optional related message ID
+        campaign_id: Optional related campaign ID
+
+    Returns:
+        True if logged
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT INTO inbox_events
+            (account_phone, peer_id, event_type, event_data, msg_id, campaign_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (clean_phone, peer_id, event_type,
+              json.dumps(event_data) if event_data else None,
+              msg_id, campaign_id))
+
+        conn.commit()
+        conn.close()
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error logging event: {str(e)}")
+        return False
+
+
+def inbox_get_conversations_needing_backfill(account_phone: str) -> List[Dict]:
+    """
+    Get conversations that need message backfill.
+
+    Args:
+        account_phone: Account phone number
+
+    Returns:
+        List of conversation dicts with needs_backfill=True
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT * FROM inbox_conversations
+            WHERE account_phone = ? AND needs_backfill = TRUE
+        ''', (clean_phone,))
+
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    except Exception as e:
+        logger.error(f"❌ Error getting backfill conversations: {str(e)}")
+        return []
+
+
+# ============================================================================
+# MATRIX CONTACT LINKING
+# ============================================================================
+
+def inbox_link_matrix_contact(account_phone: str, peer_id: int, username: str,
+                               first_name: str, last_name: str, access_hash: int,
+                               contact_type: str, campaign_id: str = None) -> bool:
+    """
+    Link a MATRIX-imported contact to inbox system.
+
+    Called after successfully importing a contact via import_dev_contacts
+    or import_kol_contacts. Creates or updates the inbox_conversation
+    record with MATRIX metadata.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+        username: Telegram username
+        first_name: Contact first name
+        last_name: Contact last name (often includes MATRIX metadata)
+        access_hash: Telegram access hash for the user
+        contact_type: 'dev' or 'kol'
+        campaign_id: Optional campaign ID for tracking
+
+    Returns:
+        True if linked successfully
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Create or update conversation with MATRIX metadata
+        cursor.execute('''
+            INSERT INTO inbox_conversations
+            (account_phone, peer_id, username, first_name, last_name,
+             access_hash, is_matrix_contact, contact_type, contact_status, campaign_id)
+            VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, 'blue', ?)
+            ON CONFLICT(account_phone, peer_id) DO UPDATE SET
+                username = COALESCE(excluded.username, username),
+                first_name = COALESCE(excluded.first_name, first_name),
+                last_name = COALESCE(excluded.last_name, last_name),
+                access_hash = COALESCE(excluded.access_hash, access_hash),
+                is_matrix_contact = TRUE,
+                contact_type = excluded.contact_type,
+                contact_status = COALESCE(contact_status, 'blue'),
+                campaign_id = COALESCE(excluded.campaign_id, campaign_id),
+                updated_at = CURRENT_TIMESTAMP
+        ''', (clean_phone, peer_id, username, first_name, last_name,
+              access_hash, contact_type, campaign_id))
+
+        conn.commit()
+        conn.close()
+
+        logger.debug(f"✅ Linked MATRIX contact {peer_id} as {contact_type} for {clean_phone}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error linking MATRIX contact: {str(e)}")
+        return False
+
+
+def inbox_get_matrix_contact(account_phone: str, peer_id: int = None,
+                              username: str = None) -> Optional[Dict]:
+    """
+    Get a MATRIX contact from inbox by peer_id or username.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Optional Telegram user ID
+        username: Optional Telegram username
+
+    Returns:
+        Conversation dict if found, None otherwise
+    """
+    if not peer_id and not username:
+        return None
+
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if peer_id:
+            cursor.execute('''
+                SELECT * FROM inbox_conversations
+                WHERE account_phone = ? AND peer_id = ? AND is_matrix_contact = TRUE
+            ''', (clean_phone, peer_id))
+        else:
+            cursor.execute('''
+                SELECT * FROM inbox_conversations
+                WHERE account_phone = ? AND LOWER(username) = LOWER(?) AND is_matrix_contact = TRUE
+            ''', (clean_phone, username))
+
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    except Exception as e:
+        logger.error(f"❌ Error getting MATRIX contact: {str(e)}")
+        return None
+
+
+def inbox_get_blue_contacts(account_phone: str, contact_type: str = None) -> List[Dict]:
+    """
+    Get all blue (not replied) MATRIX contacts for an account.
+
+    Args:
+        account_phone: Account phone number
+        contact_type: Optional filter by 'dev' or 'kol'
+
+    Returns:
+        List of conversation dicts
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if contact_type:
+            cursor.execute('''
+                SELECT * FROM inbox_conversations
+                WHERE account_phone = ? AND is_matrix_contact = TRUE
+                AND contact_status = 'blue' AND contact_type = ?
+            ''', (clean_phone, contact_type))
+        else:
+            cursor.execute('''
+                SELECT * FROM inbox_conversations
+                WHERE account_phone = ? AND is_matrix_contact = TRUE
+                AND contact_status = 'blue'
+            ''', (clean_phone,))
+
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    except Exception as e:
+        logger.error(f"❌ Error getting blue contacts: {str(e)}")
+        return []
+
+
+def inbox_update_contact_status(account_phone: str, peer_id: int,
+                                 new_status: str) -> bool:
+    """
+    Update a MATRIX contact's status (blue -> yellow).
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+        new_status: 'blue' or 'yellow'
+
+    Returns:
+        True if updated
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE inbox_conversations
+            SET contact_status = ?, first_reply_at = CASE
+                WHEN ? = 'yellow' AND first_reply_at IS NULL THEN CURRENT_TIMESTAMP
+                ELSE first_reply_at
+            END,
+            updated_at = CURRENT_TIMESTAMP
+            WHERE account_phone = ? AND peer_id = ? AND is_matrix_contact = TRUE
+        ''', (new_status, new_status, clean_phone, peer_id))
+
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+
+        if updated:
+            logger.info(f"✅ Updated contact {peer_id} status to {new_status}")
+
+        return updated
+
+    except Exception as e:
+        logger.error(f"❌ Error updating contact status: {str(e)}")
+        return False
