@@ -6608,7 +6608,13 @@ def inbox_connection_status():
     """Get connection states for all accounts."""
     global inbox_manager
     try:
-        states = inbox_get_connection_states() or {}
+        # inbox_get_connection_states returns List[Dict], convert to Dict[phone, state_info]
+        states_list = inbox_get_connection_states() or []
+        states = {}
+        for state_row in states_list:
+            phone = state_row.get('account_phone', '')
+            if phone:
+                states[phone] = state_row
 
         # Get connected accounts from GlobalConnectionManager if inbox_manager is running
         connected_phones = []
