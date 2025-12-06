@@ -28,6 +28,7 @@ import math
 
 # Telethon imports (previously in matrix.py)
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import (
     UsernameNotOccupiedError,
     UsernameInvalidError,
@@ -39,6 +40,9 @@ from telethon.errors import (
 )
 from telethon.tl.functions.contacts import AddContactRequest, GetContactsRequest
 from telethon.tl.types import User, Chat, Channel
+
+# Import TGClient for StringSession-based connections (eliminates SQLite locking)
+from tg_client import TGClient, get_session_path, session_exists, delete_session
 
 # Fix Windows encoding
 if sys.platform == 'win32':
@@ -446,32 +450,21 @@ LOGS_DIR.mkdir(exist_ok=True)
 
 def cleanup_session_locks():
     """
-    Delete WAL/SHM journal files and checkpoint sessions before startup.
-    This prevents "database is locked" errors from stale lock files.
+    Clean up any stale SQLite lock files from old sessions.
+    With StringSession, these should not exist, but clean up just in case.
     """
     cleaned = 0
-    for session_file in SESSIONS_DIR.glob('*.session'):
-        # Delete WAL and SHM files
-        for ext in ['-wal', '-shm']:
-            journal = Path(str(session_file) + ext)
-            if journal.exists():
-                try:
-                    journal.unlink()
-                    logger.info(f"🗑️ Deleted {journal.name}")
-                    cleaned += 1
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not delete {journal.name}: {e}")
-
-        # Checkpoint main session to merge WAL data
-        try:
-            conn = sqlite3.connect(str(session_file), timeout=2)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception as e:
-            logger.debug(f"Could not checkpoint {session_file.name}: {e}")
+    for ext in ['-wal', '-shm', '-journal']:
+        for lock_file in SESSIONS_DIR.glob(f'*{ext}'):
+            try:
+                lock_file.unlink()
+                logger.info(f"🗑️ Deleted stale lock file: {lock_file.name}")
+                cleaned += 1
+            except Exception as e:
+                logger.warning(f"⚠️ Could not delete {lock_file.name}: {e}")
 
     if cleaned > 0:
-        logger.info(f"✅ Cleaned up {cleaned} session journal files")
+        logger.info(f"✅ Cleaned up {cleaned} stale session lock files")
 
 
 # ============================================================================
@@ -1406,26 +1399,27 @@ class UnifiedContactManager:
 
     async def init_client(self, phone_number: str, force_new: bool = False) -> bool:
         """
-        Initialize Telegram client.
+        Initialize Telegram client using TGClient (StringSession).
 
         If GlobalConnectionManager is available (self._conn_manager), uses shared client pool.
         This prevents session file locking conflicts with InboxManager.
+
+        StringSession eliminates SQLite database locking issues entirely.
 
         Returns True if successful, False otherwise
         """
         try:
             # ========================================
-            # NEW: Use GlobalConnectionManager if available (shared client pool)
-            # This solves session file locking between inbox and operations
+            # Use GlobalConnectionManager if available (shared client pool)
+            # GlobalConnectionManager now uses TGClient internally
             # ========================================
             if self._conn_manager is not None and not force_new:
-                self.log(f"🔗 Using shared connection pool for {phone_number}")
-                session_path = str(self.session_path).replace('.session', '')
+                self.log(f"🔗 Using shared connection pool (StringSession) for {phone_number}")
                 self.client = await self._conn_manager.get_client(
                     phone_number,
                     self.api_id,
                     self.api_hash,
-                    session_path,
+                    str(self.session_path),
                     self.proxy_url,
                     register_events=False  # Operations don't need event handlers
                 )
@@ -1437,53 +1431,44 @@ class UnifiedContactManager:
                     return False
 
             # ========================================
-            # ORIGINAL: Direct client creation (for authentication flows)
-            # Used when conn_manager is not set (auth) or force_new=True
+            # Direct TGClient creation (for authentication flows)
+            # Uses StringSession - no more SQLite database locks!
             # ========================================
 
-            # Check if session exists for this phone number
+            clean_phone = phone_number.replace('+', '').replace('-', '').replace(' ', '')
+            session_name = f"session_{clean_phone}"
+
+            # Check if session exists
             if self.session_path.exists() and not force_new:
                 self.log(f"📁 Found existing session: {self.session_path.name}")
 
                 try:
-                    # Add retry logic for database busy errors
-                    max_retries = 3
-                    retry_delay = 1  # seconds
+                    # Create TGClient with StringSession
+                    self._tg_client = TGClient(
+                        session_name=session_name,
+                        api_id=self.api_id,
+                        api_hash=self.api_hash,
+                        proxy=self.proxy
+                    )
 
-                    for attempt in range(max_retries):
-                        try:
-                            self.client = TelegramClient(
-                                str(self.session_path).replace('.session', ''),
-                                self.api_id,
-                                self.api_hash,
-                                timeout=30,  # 30 second timeout for SQLite operations
-                                proxy=self.proxy  # Use proxy if configured
-                            )
-                            await self.client.connect()
-                            break
-                        except Exception as retry_error:
-                            if "database is" in str(retry_error).lower() and attempt < max_retries - 1:
-                                self.log(f"   ⏳ Database busy, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})")
-                                await asyncio.sleep(retry_delay)
-                                retry_delay *= 2  # Exponential backoff
-                            else:
-                                raise
+                    await self._tg_client.connect()
+                    self.client = self._tg_client.client
 
-                    if await self.client.is_user_authorized():
-                        me = await self.client.get_me()
+                    if await self._tg_client.is_authorized():
+                        me = await self._tg_client.get_me()
                         session_user_info = f"{me.first_name} {me.last_name}".strip() if me.last_name else me.first_name
 
                         self.log(f"   ✅ Session authenticated as: {session_user_info}")
                         # Save session to database
                         self._save_session_to_database(self.phone_number, me)
-                        self.log(f"✅ Auto-loaded session - ready to go!")
+                        self.log(f"✅ Auto-loaded session (StringSession) - ready to go!")
                         return True
                     else:
                         self.log("⚠️  Session expired, creating new...")
-                        await self.client.disconnect()
+                        await self._tg_client.disconnect(force=True)
 
-                except Exception as db_error:
-                    error_str = str(db_error).lower()
+                except Exception as session_error:
+                    error_str = str(session_error).lower()
 
                     # Handle specific errors
                     if "api id or hash cannot be empty" in error_str:
@@ -1492,40 +1477,41 @@ class UnifiedContactManager:
                         self.log(f"   ✅ Session file PRESERVED - check your config.json")
                         return False
 
-                    if "database is locked" in error_str:
-                        self.log(f"⚠️  Session locked (another process using it)")
-                        self.log(f"   🔄 Deleting locked session and creating new one...")
-                        try:
-                            if self.client:
-                                await self.client.disconnect()
-                        except:
-                            pass
-                        # Only delete if truly locked
-                        self.session_path.unlink(missing_ok=True)
-                        self.log(f"   ✅ Locked session deleted")
-                    else:
-                        self.log(f"⚠️  Session error: {str(db_error)}")
-                        self.log(f"   💡 Session file PRESERVED - you can try re-authenticating")
-                        # Don't delete on unknown errors - preserve the session
-                        try:
-                            if self.client:
-                                await self.client.disconnect()
-                        except:
-                            pass
-                        return False
+                    self.log(f"⚠️  Session error: {str(session_error)}")
+                    self.log(f"   💡 Session file PRESERVED - you can try re-authenticating")
+                    try:
+                        if hasattr(self, '_tg_client') and self._tg_client:
+                            await self._tg_client.disconnect(force=True)
+                    except:
+                        pass
+                    return False
 
-            # Create new session for this phone number
-            self.client = TelegramClient(str(self.session_path).replace('.session', ''),
-                                        self.api_id, self.api_hash, proxy=self.proxy)
+            # Create new session using TGClient
+            self._tg_client = TGClient(
+                session_name=session_name,
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                proxy=self.proxy,
+                force_init=True  # Force new instance for fresh auth
+            )
+
+            await self._tg_client.connect()
+            self.client = self._tg_client.client
+
             self.log(f"\n🔐 Starting authentication with phone: {phone_number}")
-            self.log(f"   📝 Session file: {self.session_path.name}")
+            self.log(f"   📝 Session: {session_name} (StringSession)")
             if self.proxy:
                 self.log(f"   🔌 Using proxy: {self.proxy_url}")
             self.log(f"   📱 Check your Telegram app - you'll receive an authentication code")
+
             await self.client.start(phone=phone_number)
             me = await self.client.get_me()
+
+            # Save session immediately
+            self._tg_client._save_session()
+
             self.log(f"✅ Successfully authenticated as: {me.first_name}")
-            self.log(f"   📁 Session saved to: {self.session_path.name}")
+            self.log(f"   📁 Session saved: {session_name}")
             # Save session to database
             self._save_session_to_database(phone_number, me)
             return True
@@ -1536,7 +1522,7 @@ class UnifiedContactManager:
 
     async def start_authentication(self, phone_number: str, force_new: bool = False) -> Dict:
         """
-        Start authentication process - sends code to phone
+        Start authentication process - sends code to phone using TGClient (StringSession).
         Returns dict with status and phone_hash if successful
 
         Args:
@@ -1545,49 +1531,68 @@ class UnifiedContactManager:
         """
         try:
             # IMPORTANT: First disconnect from GlobalConnectionManager if connected
-            # This releases the session file lock so we can delete/recreate it
             clean_phone = phone_number.replace('+', '').replace('-', '').replace(' ', '')
+            session_name = f"session_{clean_phone}"
+
             conn_manager = GlobalConnectionManager.get_instance()
             if conn_manager.is_connected(clean_phone):
                 self.log(f"   🔌 Disconnecting from shared pool before auth...")
                 await conn_manager.disconnect_account(clean_phone)
                 self.log(f"   ✅ Disconnected from shared pool")
 
+            # Also remove from TGClient singleton cache
+            TGClient.remove_instance(session_name, self.api_id, self.api_hash)
+
             # If force_new, delete existing session
             if force_new and self.session_path.exists():
                 self.log(f"   🗑️  Deleting existing session file for re-authentication")
                 self.session_path.unlink(missing_ok=True)
             elif self.session_path.exists():
-                # Check if existing session is valid
+                # Check if existing session is valid using TGClient
                 try:
-                    test_client = TelegramClient(str(self.session_path).replace('.session', ''),
-                                                self.api_id, self.api_hash, proxy=self.proxy)
-                    await test_client.connect()
-                    if not await test_client.is_user_authorized():
+                    test_tg = TGClient(
+                        session_name=session_name,
+                        api_id=self.api_id,
+                        api_hash=self.api_hash,
+                        proxy=self.proxy,
+                        force_init=True
+                    )
+                    await test_tg.connect()
+                    if not await test_tg.is_authorized():
                         # Session exists but is expired - delete it
                         self.log(f"   🗑️  Deleting expired session file")
+                        await test_tg.disconnect(force=True, save_session=False)
                         self.session_path.unlink(missing_ok=True)
-                    await test_client.disconnect()
+                    else:
+                        await test_tg.disconnect(force=True)
+                    TGClient.remove_instance(session_name, self.api_id, self.api_hash)
                 except:
                     # Session file is corrupted or invalid - delete it
                     self.log(f"   🗑️  Deleting invalid session file")
                     self.session_path.unlink(missing_ok=True)
+                    TGClient.remove_instance(session_name, self.api_id, self.api_hash)
 
-            # Create new session for this phone number
-            self.client = TelegramClient(str(self.session_path).replace('.session', ''),
-                                        self.api_id, self.api_hash, proxy=self.proxy)
-            await self.client.connect()
-            
+            # Create new TGClient for authentication
+            self._tg_client = TGClient(
+                session_name=session_name,
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                proxy=self.proxy,
+                force_init=True
+            )
+            await self._tg_client.connect()
+            self.client = self._tg_client.client
+
             self.log(f"\n🔐 Starting authentication with phone: {phone_number}")
-            self.log(f"   📝 Session file: {self.session_path.name}")
-            
+            self.log(f"   📝 Session: {session_name} (StringSession)")
+
             # Send code request
-            result = await self.client.send_code_request(phone_number)
+            result = await self._tg_client.send_code_request(phone_number)
             phone_code_hash = result.phone_code_hash
-            
+
             self.log(f"   📱 Code sent to {phone_number}")
             self.log(f"   💡 Enter the code you received in Telegram")
-            
+
             return {
                 'success': True,
                 'phone_code_hash': phone_code_hash,
@@ -1602,19 +1607,22 @@ class UnifiedContactManager:
 
     async def submit_code(self, phone_number: str, code: str, phone_code_hash: str) -> Dict:
         """
-        Submit authentication code
+        Submit authentication code using TGClient (StringSession).
         Returns dict with status and user info if successful
         """
         try:
-            if not self.client:
+            if not self.client and not hasattr(self, '_tg_client'):
                 return {
                     'success': False,
                     'error': 'Client not initialized. Call start_authentication first.'
                 }
-            
-            # Sign in with code
+
+            # Sign in with code using TGClient
             try:
-                me = await self.client.sign_in(phone_number, code, phone_code_hash=phone_code_hash)
+                if hasattr(self, '_tg_client') and self._tg_client:
+                    me = await self._tg_client.sign_in(phone_number, code, phone_code_hash)
+                else:
+                    me = await self.client.sign_in(phone_number, code, phone_code_hash=phone_code_hash)
             except SessionPasswordNeededError:
                 # Account has 2FA enabled
                 return {
@@ -1622,15 +1630,18 @@ class UnifiedContactManager:
                     'requires_password': True,
                     'message': 'This account has 2FA enabled. Password required.'
                 }
-            
-            # Successfully authenticated
+
+            # Successfully authenticated - save session immediately
+            if hasattr(self, '_tg_client') and self._tg_client:
+                self._tg_client._save_session()
+
             session_user_info = f"{me.first_name} {me.last_name}".strip() if me.last_name else me.first_name
             self.log(f"✅ Successfully authenticated as: {session_user_info}")
-            self.log(f"   📁 Session saved to: {self.session_path.name}")
-            
+            self.log(f"   📁 Session saved (StringSession)")
+
             # Save session to database
             self._save_session_to_database(phone_number, me)
-            
+
             return {
                 'success': True,
                 'user': {
@@ -1651,28 +1662,34 @@ class UnifiedContactManager:
 
     async def submit_password(self, password: str) -> Dict:
         """
-        Submit 2FA password
+        Submit 2FA password using TGClient (StringSession).
         Returns dict with status and user info if successful
         """
         try:
-            if not self.client:
+            if not self.client and not hasattr(self, '_tg_client'):
                 return {
                     'success': False,
                     'error': 'Client not initialized.'
                 }
-            
-            # Sign in with password
-            me = await self.client.sign_in(password=password)
-            
-            # Successfully authenticated
+
+            # Sign in with password using TGClient
+            if hasattr(self, '_tg_client') and self._tg_client:
+                me = await self._tg_client.sign_in_with_password(password)
+            else:
+                me = await self.client.sign_in(password=password)
+
+            # Successfully authenticated - save session immediately
+            if hasattr(self, '_tg_client') and self._tg_client:
+                self._tg_client._save_session()
+
             session_user_info = f"{me.first_name} {me.last_name}".strip() if me.last_name else me.first_name
             self.log(f"✅ Successfully authenticated with 2FA as: {session_user_info}")
-            self.log(f"   📁 Session saved to: {self.session_path.name}")
-            
+            self.log(f"   📁 Session saved (StringSession)")
+
             # Save session to database
             phone_number = self.phone_number
             self._save_session_to_database(phone_number, me)
-            
+
             return {
                 'success': True,
                 'user': {

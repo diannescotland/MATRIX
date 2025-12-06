@@ -1,17 +1,18 @@
 """
 MATRIX Global Connection Manager
 ================================
-Singleton that owns ALL TelegramClient instances.
+Singleton that owns ALL TelegramClient instances via TGClient wrapper.
 Both InboxManager and UnifiedContactManager use this shared pool.
 
-This solves the session file locking issue where two separate systems
-(InboxManager + UnifiedContactManager) would each create their own
-TelegramClient instances, causing file lock conflicts.
+This solves the session file locking issue by:
+1. Using StringSession instead of SQLite sessions (no database locks)
+2. Singleton pattern ensures one client per account
+3. Reference counting prevents premature disconnection
 
 Architecture:
     GlobalConnectionManager (singleton)
             │
-            ├── _clients: Dict[phone, TelegramClient]
+            ├── _tg_clients: Dict[phone, TGClient]   ← StringSession-based
             ├── _locks: Dict[phone, asyncio.Lock]
             └── _connection_info: Dict[phone, ConnectionInfo]
                     │
@@ -31,7 +32,6 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 
-import sqlite3
 import time
 
 from telethon import TelegramClient, events
@@ -41,11 +41,10 @@ from telethon.errors import (
     FloodWaitError
 )
 
-logger = logging.getLogger(__name__)
+# Import TGClient for StringSession-based connections
+from tg_client import TGClient, SESSIONS_DIR
 
-# Constants
-SESSIONS_DIR = Path(__file__).parent.parent / "sessions"
-SESSIONS_DIR.mkdir(exist_ok=True)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,7 +52,8 @@ class ConnectionInfo:
     """Information about a connected account."""
     phone: str
     client: TelegramClient
-    connected_at: datetime
+    tg_client: Optional[TGClient] = None  # Reference to TGClient wrapper
+    connected_at: datetime = field(default_factory=datetime.now)
     my_id: int = 0
     my_name: str = ""
     api_id: int = 0
@@ -66,10 +66,11 @@ class ConnectionInfo:
 
 class GlobalConnectionManager:
     """
-    Singleton that owns ALL TelegramClient instances.
+    Singleton that owns ALL TelegramClient instances via TGClient wrapper.
 
     Key features:
-    - Single TelegramClient per account (no duplicates)
+    - Uses TGClient with StringSession (no SQLite database locks)
+    - Single client per account (no duplicates)
     - Thread-safe with per-account locks
     - Shared between InboxManager and UnifiedContactManager
     - Event handlers registered once per client
@@ -94,6 +95,7 @@ class GlobalConnectionManager:
 
         self._socketio = socketio
         self._clients: Dict[str, ConnectionInfo] = {}
+        self._tg_clients: Dict[str, TGClient] = {}  # TGClient wrapper instances
         self._locks: Dict[str, asyncio.Lock] = {}
         self._operation_locks: Dict[str, asyncio.Lock] = {}  # For exclusive operations
         self._event_processor = None  # Set by InboxManager
@@ -101,7 +103,7 @@ class GlobalConnectionManager:
         self._shutting_down = False
 
         GlobalConnectionManager._initialized = True
-        logger.info("🔧 GlobalConnectionManager initialized")
+        logger.info("🔧 GlobalConnectionManager initialized (StringSession mode)")
 
     @classmethod
     def get_instance(cls, socketio=None) -> 'GlobalConnectionManager':
@@ -168,10 +170,9 @@ class GlobalConnectionManager:
                          session_path: str = None, proxy: str = None,
                          register_events: bool = True) -> Optional[TelegramClient]:
         """
-        Get or create TelegramClient for account.
+        Get or create TelegramClient for account using TGClient wrapper.
 
-        If client exists and is connected, returns it.
-        If not, creates new client and connects.
+        Uses StringSession instead of SQLite to eliminate database locking.
 
         Args:
             phone: Account phone number
@@ -186,15 +187,15 @@ class GlobalConnectionManager:
         """
         clean_phone = self._normalize_phone(phone)
 
-        # Check if already connected
-        if clean_phone in self._clients:
-            conn_info = self._clients[clean_phone]
-            if conn_info.client.is_connected():
-                logger.debug(f"Returning existing client for {clean_phone}")
-                return conn_info.client
+        # Check if already connected via TGClient
+        if clean_phone in self._tg_clients:
+            tg_client = self._tg_clients[clean_phone]
+            if tg_client.is_connected():
+                logger.debug(f"Returning existing TGClient for {clean_phone}")
+                return tg_client.client
             else:
                 # Client disconnected, will reconnect below
-                logger.info(f"Client for {clean_phone} disconnected, reconnecting...")
+                logger.info(f"TGClient for {clean_phone} disconnected, reconnecting...")
 
         # Need credentials for new connection
         if api_id is None or api_hash is None:
@@ -209,139 +210,123 @@ class GlobalConnectionManager:
                 logger.error(f"No credentials provided for {clean_phone}")
                 return None
 
-        # Generate session path if not provided
-        if not session_path:
-            session_path = str(SESSIONS_DIR / f"session_{clean_phone}")
+        # Generate session name if not provided
+        session_name = f"session_{clean_phone}"
 
         # Parse proxy
         proxy_tuple = self._parse_proxy(proxy) if isinstance(proxy, str) else proxy
 
-        # Retry logic for database locks
-        max_retries = 5
-        retry_delay = 0.5  # Start with 500ms
+        async with self._get_lock(clean_phone):
+            try:
+                logger.info(f"Connecting account {clean_phone} via TGClient (StringSession)...")
 
-        for attempt in range(max_retries):
-            async with self._get_lock(clean_phone):
-                try:
-                    logger.info(f"Connecting account {clean_phone}..." + (f" (attempt {attempt + 1})" if attempt > 0 else ""))
+                # Create or get TGClient instance (singleton pattern handles reuse)
+                tg_client = TGClient(
+                    session_name=session_name,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    proxy=proxy_tuple
+                )
 
-                    # Create client
-                    client = TelegramClient(
-                        session_path.replace('.session', ''),
-                        api_id,
-                        api_hash,
-                        proxy=proxy_tuple,
-                        timeout=30
-                    )
-
-                    # Connect
-                    await client.connect()
-
-                    # Check if authorized
-                    if not await client.is_user_authorized():
-                        logger.warning(f"Account {clean_phone} not authorized - needs authentication")
-                        await client.disconnect()
-                        return None
-
-                    # Get user info
-                    me = await client.get_me()
-
-                    # Register event handlers if requested and processor is set
-                    if register_events and self._event_processor:
-                        await self._register_event_handlers(client, clean_phone)
-
-                    # Store connection info
-                    self._clients[clean_phone] = ConnectionInfo(
-                        phone=clean_phone,
-                        client=client,
-                        connected_at=datetime.now(),
-                        my_id=me.id,
-                        my_name=me.first_name or "",
-                        api_id=api_id,
-                        api_hash=api_hash,
-                        session_path=session_path,
-                        proxy=proxy,
-                        event_handlers_registered=register_events and self._event_processor is not None
-                    )
-
-                    # Emit WebSocket event if socketio is available
-                    if self._socketio:
-                        self._socketio.emit('inbox:connection_status', {
-                            'account_phone': clean_phone,
-                            'connected': True,
-                            'event': 'connected',
-                            'timestamp': datetime.now().isoformat()
-                        })
-
-                    logger.info(f"Account {clean_phone} connected successfully")
-                    return client
-
-                except AuthKeyUnregisteredError:
-                    logger.error(f"Account {clean_phone} auth key invalid - needs re-authentication")
+                # Connect
+                connected = await tg_client.connect()
+                if not connected:
+                    logger.error(f"Failed to connect TGClient for {clean_phone}")
                     return None
 
-                except UserDeactivatedBanError:
-                    logger.error(f"Account {clean_phone} is banned/deactivated")
+                # Check if authorized
+                if not await tg_client.is_authorized():
+                    logger.warning(f"Account {clean_phone} not authorized - needs authentication")
+                    await tg_client.disconnect(force=True, save_session=False)
                     return None
 
-                except Exception as e:
-                    error_str = str(e)
-                    if "database is locked" in error_str and attempt < max_retries - 1:
-                        logger.warning(f"⚠️ Session database locked for {clean_phone}, retrying in {retry_delay}s ({attempt + 1}/{max_retries})...")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                        continue
-                    logger.error(f"Failed to connect account {clean_phone}: {e}")
-                    return None
+                # Get user info
+                me = await tg_client.get_me()
 
-        logger.error(f"Failed to connect {clean_phone} after {max_retries} retries")
-        return None
+                # Register event handlers if requested and processor is set
+                if register_events and self._event_processor:
+                    await self._register_event_handlers(tg_client.client, clean_phone)
 
-    async def disconnect_account(self, phone: str) -> None:
-        """Gracefully disconnect account with retry logic for database locks."""
+                # Store TGClient reference
+                self._tg_clients[clean_phone] = tg_client
+
+                # Store connection info
+                self._clients[clean_phone] = ConnectionInfo(
+                    phone=clean_phone,
+                    client=tg_client.client,
+                    tg_client=tg_client,
+                    connected_at=datetime.now(),
+                    my_id=me.id,
+                    my_name=me.first_name or "",
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    session_path=str(tg_client.session_path),
+                    proxy=proxy,
+                    event_handlers_registered=register_events and self._event_processor is not None
+                )
+
+                # Emit WebSocket event if socketio is available
+                if self._socketio:
+                    self._socketio.emit('inbox:connection_status', {
+                        'account_phone': clean_phone,
+                        'connected': True,
+                        'event': 'connected',
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                logger.info(f"Account {clean_phone} connected successfully (StringSession)")
+                return tg_client.client
+
+            except AuthKeyUnregisteredError:
+                logger.error(f"Account {clean_phone} auth key invalid - needs re-authentication")
+                return None
+
+            except UserDeactivatedBanError:
+                logger.error(f"Account {clean_phone} is banned/deactivated")
+                return None
+
+            except Exception as e:
+                logger.error(f"Failed to connect account {clean_phone}: {e}")
+                return None
+
+    async def disconnect_account(self, phone: str, save_session: bool = True) -> None:
+        """
+        Gracefully disconnect account.
+
+        With StringSession, no more SQLite database lock issues!
+        """
         clean_phone = self._normalize_phone(phone)
 
-        if clean_phone not in self._clients:
-            return
+        async with self._get_lock(clean_phone):
+            try:
+                # Disconnect TGClient
+                if clean_phone in self._tg_clients:
+                    tg_client = self._tg_clients[clean_phone]
+                    await tg_client.disconnect(force=True, save_session=save_session)
+                    del self._tg_clients[clean_phone]
 
-        max_retries = 5
-        retry_delay = 0.3  # Start with 300ms
+                # Clean up connection info
+                if clean_phone in self._clients:
+                    del self._clients[clean_phone]
 
-        for attempt in range(max_retries):
-            async with self._get_lock(clean_phone):
-                try:
-                    conn_info = self._clients.get(clean_phone)
-                    if conn_info and conn_info.client:
-                        if conn_info.client.is_connected():
-                            await conn_info.client.disconnect()
+                # Emit WebSocket event
+                if self._socketio:
+                    self._socketio.emit('inbox:connection_status', {
+                        'account_phone': clean_phone,
+                        'connected': False,
+                        'event': 'disconnected',
+                        'timestamp': datetime.now().isoformat()
+                    })
 
-                        if clean_phone in self._clients:
-                            del self._clients[clean_phone]
+                logger.info(f"Account {clean_phone} disconnected")
 
-                    # Emit WebSocket event
-                    if self._socketio:
-                        self._socketio.emit('inbox:connection_status', {
-                            'account_phone': clean_phone,
-                            'connected': False,
-                            'event': 'disconnected',
-                            'timestamp': datetime.now().isoformat()
-                        })
-
-                    logger.info(f"Account {clean_phone} disconnected")
-                    return  # Success, exit the retry loop
-
-                except Exception as e:
-                    error_str = str(e)
-                    if "database is locked" in error_str and attempt < max_retries - 1:
-                        logger.warning(f"⚠️ Database locked during disconnect for {clean_phone}, retrying in {retry_delay}s ({attempt + 1}/{max_retries})...")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                        continue
-                    logger.error(f"Error disconnecting {clean_phone}: {e}")
-                    # Still try to clean up
-                    if clean_phone in self._clients:
-                        del self._clients[clean_phone]
-                    return
+            except Exception as e:
+                logger.error(f"Error disconnecting {clean_phone}: {e}")
+                # Still try to clean up
+                if clean_phone in self._tg_clients:
+                    del self._tg_clients[clean_phone]
+                if clean_phone in self._clients:
+                    del self._clients[clean_phone]
 
     @asynccontextmanager
     async def with_client(self, phone: str, api_id: int = None, api_hash: str = None,
@@ -382,14 +367,20 @@ class GlobalConnectionManager:
     def is_connected(self, phone: str) -> bool:
         """Check if account is connected."""
         clean_phone = self._normalize_phone(phone)
+
+        # Check TGClient first
+        if clean_phone in self._tg_clients:
+            return self._tg_clients[clean_phone].is_connected()
+
+        # Fallback to connection info
         conn_info = self._clients.get(clean_phone)
         return conn_info is not None and conn_info.client.is_connected()
 
     def get_connected_accounts(self) -> List[str]:
         """Get list of connected account phones."""
         return [
-            phone for phone, info in self._clients.items()
-            if info.client.is_connected()
+            phone for phone, tg_client in self._tg_clients.items()
+            if tg_client.is_connected()
         ]
 
     def get_connection_info(self, phone: str) -> Optional[ConnectionInfo]:
@@ -397,15 +388,24 @@ class GlobalConnectionManager:
         clean_phone = self._normalize_phone(phone)
         return self._clients.get(clean_phone)
 
+    def get_tg_client(self, phone: str) -> Optional[TGClient]:
+        """Get TGClient instance for an account."""
+        clean_phone = self._normalize_phone(phone)
+        return self._tg_clients.get(clean_phone)
+
     async def shutdown(self) -> None:
         """Gracefully shutdown all connections."""
         self._shutting_down = True
         logger.info("Shutting down GlobalConnectionManager...")
 
-        for phone in list(self._clients.keys()):
-            await self.disconnect_account(phone)
+        # Disconnect all TGClients (sessions will be saved)
+        for phone in list(self._tg_clients.keys()):
+            await self.disconnect_account(phone, save_session=True)
 
-        logger.info("All connections closed")
+        # Also use TGClient class method for any orphaned instances
+        await TGClient.disconnect_all()
+
+        logger.info("All connections closed (sessions saved)")
 
     async def _register_event_handlers(self, client: TelegramClient, phone: str):
         """Register Telethon event handlers for account."""

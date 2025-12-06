@@ -958,7 +958,15 @@ class InboxManager:
             if success:
                 self._rate_limiters[phone] = DMRateLimiter(phone)
                 # Update database connection state
-                inbox_update_connection_state(phone, True)
+                inbox_update_connection_state(phone, True, error=None, state='connected')
+            else:
+                # Save error state so frontend can display it
+                inbox_update_connection_state(
+                    phone,
+                    False,
+                    error='Account needs re-authentication',
+                    state='auth_required'
+                )
 
             # Small delay between connections
             await asyncio.sleep(0.5)
@@ -967,7 +975,12 @@ class InboxManager:
         return results
 
     async def connect_account(self, phone: str) -> bool:
-        """Connect a single account."""
+        """
+        Connect a single account.
+        
+        After connecting, triggers an initial dialog sync to populate
+        conversations and messages in the database.
+        """
         account = get_account_by_phone(phone)
         if not account:
             return False
@@ -988,7 +1001,23 @@ class InboxManager:
 
         if success:
             self._rate_limiters[phone] = DMRateLimiter(phone)
-            inbox_update_connection_state(phone, True)
+            inbox_update_connection_state(phone, True, error=None, state='connected')
+
+            # Trigger initial sync to populate conversations and messages
+            logger.info(f"📱 Running initial sync for {phone}...")
+            try:
+                await self.trigger_dialog_sync(phone)
+            except Exception as e:
+                logger.warning(f"⚠️ Initial sync failed for {phone}: {e}")
+        else:
+            # Save the error to database so frontend can display it
+            inbox_update_connection_state(
+                phone,
+                False,
+                error='Account needs re-authentication',
+                state='auth_required'
+            )
+            logger.warning(f"⚠️ Account {phone} connection failed - saved error to database")
 
         return success
 
@@ -1084,8 +1113,21 @@ class InboxManager:
     # ==================== Sync Triggers ====================
 
     async def trigger_dialog_sync(self, phone: str) -> SyncResult:
-        """Trigger dialog sync for an account."""
-        return await self._sync_engine.sync_dialogs(phone)
+        """
+        Trigger dialog sync for an account.
+        
+        IMPORTANT: After detecting gaps, immediately process backfills
+        so messages are available right away (not waiting 5 min for scheduler).
+        """
+        result = await self._sync_engine.sync_dialogs(phone)
+        
+        # If gaps detected, immediately backfill so messages appear now
+        if result.gaps_detected > 0:
+            logger.info(f"📥 Immediately backfilling {result.gaps_detected} conversations for {phone}")
+            backfilled = await self._sync_engine.process_pending_backfills(phone)
+            logger.info(f"✅ Backfilled {backfilled} messages for {phone}")
+        
+        return result
 
     async def trigger_full_sync(self, phone: str) -> FullSyncResult:
         """Trigger full sync for an account."""
@@ -1105,7 +1147,8 @@ class InboxManager:
                     break
                 for phone in self._conn_manager.get_connected_accounts():
                     try:
-                        await self._sync_engine.sync_dialogs(phone)
+                        # Use trigger_dialog_sync which includes immediate backfill
+                        await self.trigger_dialog_sync(phone)
                     except Exception as e:
                         logger.error(f"❌ Scheduled dialog sync failed for {phone}: {e}")
                     await asyncio.sleep(1)  # Small delay between accounts

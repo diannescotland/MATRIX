@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 
-from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
+
+# Import TGClient for StringSession-based connections
+from tg_client import TGClient
 
 # Database path (root level, one level up from backend/)
 DB_PATH = Path(__file__).parent.parent / "accounts.db"
@@ -350,11 +352,8 @@ def _cleanup_session_files(session_path: str, phone: str) -> int:
     """
     Clean up session files for a deleted account.
 
-    Deletes:
-    - .session file
-    - -journal file (SQLite journal)
-    - -wal file (Write-Ahead Log)
-    - -shm file (Shared memory)
+    With StringSession, only the .session file exists (plain text).
+    Also cleans up any stale SQLite lock files from old format.
 
     Args:
         session_path: Base path to session file (without .session extension)
@@ -364,32 +363,28 @@ def _cleanup_session_files(session_path: str, phone: str) -> int:
         Number of files successfully deleted
     """
     files_deleted = 0
-    base_path = session_path.replace('.session', '')
-
-    # Extensions to clean up
-    extensions = ['.session', '.session-journal', '.session-wal', '.session-shm']
-
-    for ext in extensions:
-        file_path = Path(f"{base_path}{ext}")
-        if file_path.exists():
-            try:
-                file_path.unlink()
-                logger.debug(f"🗑️ Deleted session file: {file_path}")
-                files_deleted += 1
-            except Exception as e:
-                logger.warning(f"⚠️ Could not delete {file_path}: {e}")
-
-    # Also try with just the phone number in sessions directory
     sessions_dir = Path(__file__).parent.parent / "sessions"
-    for ext in extensions:
-        file_path = sessions_dir / f"session_{phone}{ext}"
-        if file_path.exists():
+
+    # Primary session file (StringSession format - plain text)
+    session_file = sessions_dir / f"session_{phone}.session"
+    if session_file.exists():
+        try:
+            session_file.unlink()
+            logger.debug(f"🗑️ Deleted session file: {session_file}")
+            files_deleted += 1
+        except Exception as e:
+            logger.warning(f"⚠️ Could not delete {session_file}: {e}")
+
+    # Clean up any stale SQLite lock files (from old format)
+    for ext in ['-journal', '-wal', '-shm']:
+        lock_file = sessions_dir / f"session_{phone}.session{ext}"
+        if lock_file.exists():
             try:
-                file_path.unlink()
-                logger.debug(f"🗑️ Deleted session file: {file_path}")
+                lock_file.unlink()
+                logger.debug(f"🗑️ Deleted stale lock file: {lock_file}")
                 files_deleted += 1
             except Exception as e:
-                logger.warning(f"⚠️ Could not delete {file_path}: {e}")
+                logger.warning(f"⚠️ Could not delete {lock_file}: {e}")
 
     return files_deleted
 
@@ -417,37 +412,34 @@ async def validate_account(phone: str, api_id: int = None, api_hash: str = None)
         
         if not api_id or not api_hash:
             return False, "API credentials not available"
-        
-        # Get session path
-        account = get_account_by_phone(phone)
-        if account and account.get('session_path'):
-            session_path = account['session_path'].replace('.session', '')
-        else:
-            # Construct default session path (root level, one level up from backend/)
-            clean_phone = phone.replace('+', '').replace('-', '').replace(' ', '')
-            sessions_dir = Path(__file__).parent.parent / "sessions"
-            session_path = str(sessions_dir / f"session_{clean_phone}")
-        
-        # Try to connect
-        client = TelegramClient(session_path, api_id, api_hash)
-        
+
+        # Generate session name
+        clean_phone = phone.replace('+', '').replace('-', '').replace(' ', '')
+        session_name = f"session_{clean_phone}"
+
+        # Try to connect using TGClient (StringSession-based)
+        tg_client = TGClient(session_name, api_id, api_hash, force_init=True)
+
         try:
-            await client.connect()
-            
-            if await client.is_user_authorized():
-                me = await client.get_me()
-                await client.disconnect()
+            await tg_client.connect()
+
+            if await tg_client.is_authorized():
+                me = await tg_client.get_me()
+                await tg_client.disconnect()
                 return True, f"Account validated: {me.first_name}"
             else:
-                await client.disconnect()
+                await tg_client.disconnect()
                 return False, "Session expired - needs re-authentication"
         except SessionPasswordNeededError:
-            await client.disconnect()
+            await tg_client.disconnect()
             return False, "Account requires 2FA password"
         except Exception as e:
-            await client.disconnect()
+            try:
+                await tg_client.disconnect()
+            except:
+                pass
             return False, f"Validation error: {str(e)}"
-            
+
     except Exception as e:
         return False, f"Error validating account: {str(e)}"
 
@@ -1210,6 +1202,8 @@ def init_inbox_tables():
                 connected_at TIMESTAMP,
                 last_disconnect_at TIMESTAMP,
                 reconnect_attempts INTEGER DEFAULT 0,
+                error TEXT,
+                state TEXT DEFAULT 'disconnected',
 
                 last_dialog_sync TIMESTAMP,
                 last_full_sync TIMESTAMP,
@@ -1219,6 +1213,16 @@ def init_inbox_tables():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # Add error and state columns if they don't exist (migration)
+        try:
+            cursor.execute('ALTER TABLE inbox_connection_state ADD COLUMN error TEXT')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            cursor.execute("ALTER TABLE inbox_connection_state ADD COLUMN state TEXT DEFAULT 'disconnected'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # ============================================================================
         # DM_HISTORY: Track sent DMs for duplicate detection & rate limiting
