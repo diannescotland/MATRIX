@@ -703,6 +703,20 @@ export const sendInboxMessage = async (phone, peerId, text, campaignId = null) =
   }
 }
 
+// Fetch full message history for a conversation (on-demand)
+export const fetchInboxHistory = async (phone, peerId) => {
+  try {
+    const response = await apiClient.post(
+      `/inbox/${encodeURIComponent(phone)}/conversations/${peerId}/fetch-history`,
+      {},
+      { timeout: 120000 } // 2 minutes for large histories
+    )
+    return response
+  } catch (error) {
+    throw error
+  }
+}
+
 export const getInboxRateLimitStatus = async (phone) => {
   try {
     const response = await apiClient.get(

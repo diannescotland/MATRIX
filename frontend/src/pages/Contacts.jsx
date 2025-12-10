@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { AlertCircle, RefreshCw } from 'lucide-react'
+import { AlertCircle, RefreshCw, Search, List } from 'lucide-react'
 
 function Contacts({ isConnected }) {
   const { selectedAccounts } = useContext(AccountContext)
@@ -68,7 +68,7 @@ function Contacts({ isConnected }) {
 
   if (!isConnected) {
     return (
-      <div className="p-5">
+      <div className="p-6">
         <Alert variant="destructive">
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>
@@ -80,12 +80,15 @@ function Contacts({ isConnected }) {
   }
 
   return (
-    <div className="p-5">
+    <div className="p-6 animate-fade-in">
       {/* Filters */}
       <Card className="mb-6">
         <CardHeader>
           <CardTitle className="flex items-center justify-between">
-            <span>🔍 Search & Filter</span>
+            <span className="flex items-center gap-2">
+              <Search className="h-5 w-5 text-primary" />
+              Search & Filter
+            </span>
             <Button variant="outline" size="sm" onClick={fetchContacts}>
               <RefreshCw className="h-4 w-4 mr-2" />
               Refresh
@@ -163,7 +166,10 @@ function Contacts({ isConnected }) {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center justify-between">
-            <span>📋 Contacts</span>
+            <span className="flex items-center gap-2">
+              <List className="h-5 w-5 text-primary" />
+              Contacts
+            </span>
             <div className="text-sm font-normal text-muted-foreground">
               {total > 0 && (
                 <>

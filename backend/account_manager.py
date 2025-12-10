@@ -1224,6 +1224,25 @@ def init_inbox_tables():
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Add profile photo columns to inbox_conversations (migration)
+        profile_photo_columns = [
+            'profile_photo_base64 TEXT',
+            'profile_photo_id TEXT',
+            'profile_photo_updated_at TIMESTAMP',
+            "profile_photo_status TEXT DEFAULT 'pending'"
+        ]
+        for col in profile_photo_columns:
+            try:
+                cursor.execute(f'ALTER TABLE inbox_conversations ADD COLUMN {col}')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        # Add history_fetched column for on-demand full history fetch (migration)
+        try:
+            cursor.execute("ALTER TABLE inbox_conversations ADD COLUMN history_fetched BOOLEAN DEFAULT FALSE")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # ============================================================================
         # DM_HISTORY: Track sent DMs for duplicate detection & rate limiting
         # ============================================================================
@@ -1391,18 +1410,23 @@ def inbox_get_conversations(account_phone: str, limit: int = 50, offset: int = 0
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        where_parts = ["account_phone = ?"]
+        where_parts = ["c.account_phone = ?"]
         params = [clean_phone]
 
         if unread_only:
-            where_parts.append("unread_count > 0")
+            where_parts.append("c.unread_count > 0")
         if matrix_only:
-            where_parts.append("is_matrix_contact = TRUE")
+            where_parts.append("c.is_matrix_contact = TRUE")
 
         query = f'''
-            SELECT * FROM inbox_conversations
+            SELECT c.*,
+                   (SELECT COUNT(*) FROM inbox_messages m
+                    WHERE m.account_phone = c.account_phone
+                    AND m.peer_id = c.peer_id
+                    AND m.is_outgoing = 0) as incoming_count
+            FROM inbox_conversations c
             WHERE {" AND ".join(where_parts)}
-            ORDER BY last_msg_date DESC NULLS LAST
+            ORDER BY c.last_msg_date DESC NULLS LAST
             LIMIT ? OFFSET ?
         '''
         params.extend([limit, offset])
@@ -2194,3 +2218,235 @@ def inbox_update_contact_status(account_phone: str, peer_id: int,
     except Exception as e:
         logger.error(f"❌ Error updating contact status: {str(e)}")
         return False
+
+
+# ============================================================================
+# PROFILE PHOTO FUNCTIONS
+# ============================================================================
+
+def inbox_update_profile_photo(account_phone: str, peer_id: int,
+                                photo_base64: str, photo_id: str) -> bool:
+    """
+    Update profile photo for a conversation.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+        photo_base64: Base64-encoded JPEG image
+        photo_id: Telegram photo ID for change detection
+
+    Returns:
+        True if updated
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE inbox_conversations
+            SET profile_photo_base64 = ?,
+                profile_photo_id = ?,
+                profile_photo_updated_at = CURRENT_TIMESTAMP,
+                profile_photo_status = 'fetched',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE account_phone = ? AND peer_id = ?
+        ''', (photo_base64, photo_id, clean_phone, peer_id))
+
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+
+    except Exception as e:
+        logger.error(f"❌ Error updating profile photo: {str(e)}")
+        return False
+
+
+def inbox_set_no_profile_photo(account_phone: str, peer_id: int) -> bool:
+    """
+    Mark conversation as having no profile photo.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+
+    Returns:
+        True if updated
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE inbox_conversations
+            SET profile_photo_status = 'no_photo',
+                profile_photo_updated_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE account_phone = ? AND peer_id = ?
+        ''', (clean_phone, peer_id))
+
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+
+    except Exception as e:
+        logger.error(f"❌ Error setting no profile photo: {str(e)}")
+        return False
+
+
+def inbox_set_profile_photo_error(account_phone: str, peer_id: int) -> bool:
+    """
+    Mark profile photo fetch as failed.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+
+    Returns:
+        True if updated
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE inbox_conversations
+            SET profile_photo_status = 'error',
+                profile_photo_updated_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE account_phone = ? AND peer_id = ?
+        ''', (clean_phone, peer_id))
+
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+
+    except Exception as e:
+        logger.error(f"❌ Error setting profile photo error: {str(e)}")
+        return False
+
+
+def inbox_get_conversations_needing_photos(account_phone: str, limit: int = 50) -> List[Dict]:
+    """
+    Get conversations that need profile photo fetch.
+
+    Returns conversations where:
+    - profile_photo_status is 'pending' (never fetched)
+    - profile_photo_status is 'fetched' but older than 7 days (stale)
+    - profile_photo_status is 'error' and older than 1 day (retry)
+
+    Args:
+        account_phone: Account phone number
+        limit: Maximum conversations to return
+
+    Returns:
+        List of conversation dicts needing photo fetch
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT * FROM inbox_conversations
+            WHERE account_phone = ? AND (
+                profile_photo_status = 'pending'
+                OR profile_photo_status IS NULL
+                OR (profile_photo_status = 'fetched' AND
+                    profile_photo_updated_at < datetime('now', '-7 days'))
+                OR (profile_photo_status = 'error' AND
+                    profile_photo_updated_at < datetime('now', '-1 day'))
+            )
+            ORDER BY last_msg_date DESC NULLS LAST
+            LIMIT ?
+        ''', (clean_phone, limit))
+
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    except Exception as e:
+        logger.error(f"❌ Error getting conversations needing photos: {str(e)}")
+        return []
+
+
+def inbox_mark_history_fetched(account_phone: str, peer_id: int) -> bool:
+    """
+    Mark conversation as having full history fetched.
+
+    Args:
+        account_phone: Account phone number
+        peer_id: Telegram user ID
+
+    Returns:
+        True if updated
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE inbox_conversations
+            SET history_fetched = TRUE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE account_phone = ? AND peer_id = ?
+        ''', (clean_phone, peer_id))
+
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+
+    except Exception as e:
+        logger.error(f"❌ Error marking history fetched: {str(e)}")
+        return False
+
+
+def inbox_get_photo_sync_stats(account_phone: str) -> Dict:
+    """
+    Get profile photo sync statistics for an account.
+
+    Args:
+        account_phone: Account phone number
+
+    Returns:
+        Dict with counts by status
+    """
+    try:
+        clean_phone = normalize_phone(account_phone)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN profile_photo_status = 'fetched' THEN 1 ELSE 0 END) as fetched,
+                SUM(CASE WHEN profile_photo_status = 'no_photo' THEN 1 ELSE 0 END) as no_photo,
+                SUM(CASE WHEN profile_photo_status = 'pending' OR profile_photo_status IS NULL THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN profile_photo_status = 'error' THEN 1 ELSE 0 END) as error
+            FROM inbox_conversations
+            WHERE account_phone = ?
+        ''', (clean_phone,))
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            return {
+                'total': row['total'] or 0,
+                'fetched': row['fetched'] or 0,
+                'no_photo': row['no_photo'] or 0,
+                'pending': row['pending'] or 0,
+                'error': row['error'] or 0
+            }
+        return {'total': 0, 'fetched': 0, 'no_photo': 0, 'pending': 0, 'error': 0}
+
+    except Exception as e:
+        logger.error(f"❌ Error getting photo sync stats: {str(e)}")
+        return {'total': 0, 'fetched': 0, 'no_photo': 0, 'pending': 0, 'error': 0}

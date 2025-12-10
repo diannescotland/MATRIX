@@ -20,6 +20,7 @@ Based on INBOX_IMPLEMENTATION_PLAN.md decisions:
 """
 
 import asyncio
+import base64
 import logging
 import threading
 import time
@@ -51,7 +52,13 @@ from account_manager import (
     inbox_update_connection_state, inbox_get_connection_states,
     inbox_increment_reconnect_attempts, inbox_record_dm_sent, inbox_check_dm_sent,
     inbox_get_dm_count_today, inbox_log_event, inbox_get_conversations_needing_backfill,
-    inbox_update_contact_status, inbox_update_campaign_metrics
+    inbox_update_contact_status, inbox_update_campaign_metrics,
+    # Profile photo functions
+    inbox_update_profile_photo, inbox_set_no_profile_photo,
+    inbox_set_profile_photo_error, inbox_get_conversations_needing_photos,
+    inbox_get_photo_sync_stats,
+    # History fetch
+    inbox_mark_history_fetched
 )
 
 # Import GlobalConnectionManager for shared client management
@@ -567,12 +574,15 @@ class SyncEngine:
                 )
 
                 db_last_msg_id = conv.get('last_msg_id', 0) or 0
+                db_last_msg_text = conv.get('last_msg_text') or ""
 
                 # ========== GAP DETECTION LOGIC ==========
                 gap = dialog_last_msg_id - db_last_msg_id
 
                 if gap == 0:
-                    # No new messages - SKIP
+                    # No new messages - but ensure last_msg_text is populated
+                    if not db_last_msg_text and dialog_msg.text:
+                        await self._update_conversation_last_msg(clean_phone, peer_id, dialog_msg, my_id)
                     result.skipped += 1
                     continue
 
@@ -584,6 +594,8 @@ class SyncEngine:
 
                 elif gap >= 2:
                     # MULTIPLE MESSAGES MISSING - mark for backfill
+                    # Also update last_msg from dialog so UI shows something
+                    await self._update_conversation_last_msg(clean_phone, peer_id, dialog_msg, my_id)
                     inbox_update_conversation(
                         clean_phone, peer_id,
                         needs_backfill=True,
@@ -785,6 +797,128 @@ class SyncEngine:
 
 
 # ============================================================================
+# PROFILE PHOTO SYNCER
+# ============================================================================
+
+class ProfilePhotoSyncer:
+    """
+    Background service to fetch and cache Telegram profile photos.
+
+    Strategy:
+    - Run every 10 minutes
+    - Fetch max 20 photos per run per account (rate limit protection)
+    - Check photo_id for changes before downloading
+    - Use small/thumbnail version to keep DB size reasonable (~10-20KB per photo)
+    - Store as base64 in database for easy frontend consumption
+    """
+
+    SYNC_INTERVAL = 10 * 60         # 10 minutes
+    PHOTOS_PER_RUN = 20             # Max photos to fetch per account per run
+    PHOTO_STALE_DAYS = 7            # Re-check photos older than this
+    DELAY_BETWEEN_PHOTOS = 0.5      # Seconds between downloads (rate limit protection)
+
+    def __init__(self, conn_manager: GlobalConnectionManager, socketio: SocketIO):
+        self._conn_manager = conn_manager
+        self._socketio = socketio
+
+    async def sync_photos_for_account(self, account_phone: str) -> int:
+        """
+        Fetch profile photos for conversations that need them.
+
+        Returns:
+            Number of photos fetched
+        """
+        clean_phone = normalize_phone(account_phone)
+
+        # Get conversations needing photos
+        conversations = inbox_get_conversations_needing_photos(clean_phone, self.PHOTOS_PER_RUN)
+        if not conversations:
+            return 0
+
+        conn_info = self._conn_manager.get_connection_info(clean_phone)
+        if not conn_info or not conn_info.client.is_connected():
+            logger.debug(f"⚠️ Account {clean_phone} not connected, skipping photo sync")
+            return 0
+
+        client = conn_info.client
+        fetched = 0
+
+        for conv in conversations:
+            try:
+                peer_id = conv['peer_id']
+
+                # Small delay between fetches to avoid rate limiting
+                await asyncio.sleep(self.DELAY_BETWEEN_PHOTOS)
+
+                # Get entity to check current photo
+                try:
+                    entity = await client.get_entity(peer_id)
+                except Exception as e:
+                    logger.debug(f"⚠️ Could not get entity for {peer_id}: {e}")
+                    inbox_set_profile_photo_error(clean_phone, peer_id)
+                    continue
+
+                # Check if user has a photo
+                if not entity.photo:
+                    inbox_set_no_profile_photo(clean_phone, peer_id)
+                    logger.debug(f"📷 No photo for {peer_id}")
+                    continue
+
+                # Check if photo changed (photo_id comparison)
+                current_photo_id = str(entity.photo.photo_id)
+                if conv.get('profile_photo_id') == current_photo_id:
+                    # Photo unchanged, just update timestamp (mark as checked)
+                    inbox_update_conversation(
+                        clean_phone, peer_id,
+                        profile_photo_updated_at=datetime.now().isoformat()
+                    )
+                    logger.debug(f"📷 Photo unchanged for {peer_id}")
+                    continue
+
+                # Download photo as bytes (small/thumbnail version)
+                try:
+                    photo_bytes = await client.download_profile_photo(
+                        entity,
+                        file=bytes,
+                        download_big=False  # Use small version (~100px, typically 5-15KB)
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to download photo for {peer_id}: {e}")
+                    inbox_set_profile_photo_error(clean_phone, peer_id)
+                    continue
+
+                if photo_bytes:
+                    # Convert to base64
+                    photo_base64 = base64.b64encode(photo_bytes).decode('utf-8')
+                    inbox_update_profile_photo(clean_phone, peer_id, photo_base64, current_photo_id)
+                    fetched += 1
+                    logger.debug(f"📷 Fetched photo for {peer_id} ({len(photo_base64)} chars)")
+
+                    # Emit WebSocket event to notify frontend
+                    self._socketio.emit('inbox:photo_updated', {
+                        'account_phone': clean_phone,
+                        'peer_id': peer_id,
+                        'has_photo': True
+                    }, room=f"inbox:{clean_phone}")
+                else:
+                    inbox_set_no_profile_photo(clean_phone, peer_id)
+
+            except FloodWaitError as e:
+                logger.warning(f"⚠️ Rate limited fetching photos, wait {e.seconds}s")
+                break  # Stop this run, continue next scheduled run
+
+            except Exception as e:
+                logger.error(f"❌ Error fetching photo for {conv.get('peer_id')}: {e}")
+                inbox_set_profile_photo_error(clean_phone, conv.get('peer_id'))
+
+        return fetched
+
+    def get_sync_stats(self, account_phone: str) -> Dict:
+        """Get profile photo sync statistics for an account."""
+        return inbox_get_photo_sync_stats(account_phone)
+
+
+# ============================================================================
 # DM RATE LIMITER
 # ============================================================================
 
@@ -883,7 +1017,7 @@ class InboxManager:
         self._conn_manager = conn_manager or GlobalConnectionManager.get_instance(socketio)
         self._processor = EventProcessor(socketio, self._conn_manager)
         self._sync_engine = SyncEngine(self._conn_manager, self._processor, socketio)
-        self._rate_limiters: Dict[str, DMRateLimiter] = {}
+        self._photo_syncer = ProfilePhotoSyncer(self._conn_manager, socketio)
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._scheduler_tasks: List[asyncio.Task] = []
@@ -954,9 +1088,7 @@ class InboxManager:
             success = client is not None
             results[phone] = success
 
-            # Initialize rate limiter for connected accounts
             if success:
-                self._rate_limiters[phone] = DMRateLimiter(phone)
                 # Update database connection state
                 inbox_update_connection_state(phone, True, error=None, state='connected')
             else:
@@ -1000,7 +1132,6 @@ class InboxManager:
         success = client is not None
 
         if success:
-            self._rate_limiters[phone] = DMRateLimiter(phone)
             inbox_update_connection_state(phone, True, error=None, state='connected')
 
             # Trigger initial sync to populate conversations and messages
@@ -1024,9 +1155,6 @@ class InboxManager:
     async def disconnect_account(self, phone: str) -> None:
         """Disconnect a single account."""
         await self._conn_manager.disconnect_account(phone)
-        clean_phone = normalize_phone(phone)
-        if clean_phone in self._rate_limiters:
-            del self._rate_limiters[clean_phone]
 
     # ==================== Query Methods ====================
 
@@ -1044,36 +1172,152 @@ class InboxManager:
         """Get connection status for all accounts."""
         return inbox_get_connection_states()
 
-    def get_rate_limit_status(self, phone: str) -> Dict:
-        """Get rate limit status for an account."""
+    def get_photo_sync_stats(self, phone: str) -> Dict:
+        """Get profile photo sync statistics for an account."""
+        return self._photo_syncer.get_sync_stats(phone)
+
+    async def trigger_photo_sync(self, phone: str) -> int:
+        """Manually trigger profile photo sync for an account."""
+        return await self._photo_syncer.sync_photos_for_account(phone)
+
+    # ==================== Full History Fetch ====================
+
+    async def fetch_full_history(self, phone: str, peer_id: int) -> Dict:
+        """
+        Fetch complete message history for a conversation.
+
+        Called on-demand when user opens a conversation for the first time.
+        Fetches all messages in batches of 100 (efficient API usage).
+
+        Args:
+            phone: Account phone number
+            peer_id: Telegram user ID
+
+        Returns:
+            Dict with success, total_fetched, already_had
+        """
         clean_phone = normalize_phone(phone)
-        if clean_phone not in self._rate_limiters:
-            self._rate_limiters[clean_phone] = DMRateLimiter(clean_phone)
-        return self._rate_limiters[clean_phone].get_status()
+
+        # Get conversation to check if already fetched
+        conv = inbox_get_or_create_conversation(clean_phone, peer_id)
+        if conv.get('history_fetched'):
+            return {
+                'success': True,
+                'total_fetched': 0,
+                'already_fetched': True,
+                'message': 'History already fetched'
+            }
+
+        # Get client
+        conn_info = self._conn_manager.get_connection_info(clean_phone)
+        if not conn_info or not conn_info.client.is_connected():
+            return {
+                'success': False,
+                'error': 'Account not connected'
+            }
+
+        client = conn_info.client
+        my_id = conn_info.my_id
+
+        try:
+            total_fetched = 0
+            offset_id = 0  # Start from newest
+            batch_size = 100
+
+            logger.info(f"📥 Fetching full history for {peer_id}...")
+
+            while True:
+                # Fetch batch of messages (oldest first when we reverse)
+                messages = await client.get_messages(
+                    peer_id,
+                    limit=batch_size,
+                    offset_id=offset_id
+                )
+
+                if not messages:
+                    break
+
+                # Insert each message
+                for msg in messages:
+                    if not msg or not msg.id:
+                        continue
+
+                    is_outgoing = msg.out
+                    from_id = my_id if is_outgoing else (msg.sender_id or peer_id)
+
+                    inbox_insert_message(
+                        clean_phone, peer_id, msg.id, from_id, is_outgoing,
+                        msg.text or "", msg.date,
+                        reply_to_msg_id=msg.reply_to_msg_id if msg.reply_to else None,
+                        media_type=self._sync_engine._processor._get_media_type(msg),
+                        synced_via='full_history'
+                    )
+                    total_fetched += 1
+
+                # Update offset for next batch
+                offset_id = messages[-1].id
+
+                # If we got less than batch_size, we've reached the end
+                if len(messages) < batch_size:
+                    break
+
+                # Small delay to avoid rate limiting
+                await asyncio.sleep(0.3)
+
+            # Mark history as fetched
+            inbox_mark_history_fetched(clean_phone, peer_id)
+
+            # Update conversation with latest message info
+            if total_fetched > 0:
+                # Get the latest message to update conversation
+                latest_msgs = await client.get_messages(peer_id, limit=1)
+                if latest_msgs:
+                    latest = latest_msgs[0]
+                    is_outgoing = latest.out
+                    from_id = my_id if is_outgoing else (latest.sender_id or peer_id)
+                    inbox_update_conversation(
+                        clean_phone, peer_id,
+                        last_msg_id=latest.id,
+                        last_msg_date=latest.date,
+                        last_msg_text=(latest.text or "")[:100],
+                        last_msg_from_id=from_id,
+                        last_msg_is_outgoing=is_outgoing
+                    )
+
+            logger.info(f"✅ Fetched {total_fetched} messages for {peer_id}")
+
+            return {
+                'success': True,
+                'total_fetched': total_fetched,
+                'already_fetched': False
+            }
+
+        except FloodWaitError as e:
+            logger.warning(f"⚠️ Rate limited during history fetch: {e.seconds}s")
+            return {
+                'success': False,
+                'error': f'Rate limited, wait {e.seconds}s',
+                'wait_seconds': e.seconds
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error fetching full history: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
     # ==================== Send Message ====================
 
     async def send_message(self, phone: str, peer_id: int, text: str,
                            campaign_id: str = None) -> Dict:
         """
-        Send message with rate limiting.
+        Send message.
 
         Returns:
-            Dict with success, msg_id, error, rate_limit_status
+            Dict with success, msg_id, error
         """
         clean_phone = normalize_phone(phone)
-
-        # Check rate limit
-        if clean_phone not in self._rate_limiters:
-            self._rate_limiters[clean_phone] = DMRateLimiter(clean_phone)
-
-        can_send, reason = self._rate_limiters[clean_phone].can_send(peer_id, campaign_id)
-        if not can_send:
-            return {
-                'success': False,
-                'error': reason,
-                'rate_limit_status': self._rate_limiters[clean_phone].get_status()
-            }
 
         # Get client from GlobalConnectionManager
         conn_info = self._conn_manager.get_connection_info(clean_phone)
@@ -1088,13 +1332,9 @@ class InboxManager:
             # Send message
             message = await client.send_message(peer_id, text)
 
-            # Record in rate limiter
-            self._rate_limiters[clean_phone].record_sent(peer_id, message.id, campaign_id)
-
             return {
                 'success': True,
-                'msg_id': message.id,
-                'rate_limit_status': self._rate_limiters[clean_phone].get_status()
+                'msg_id': message.id
             }
 
         except FloodWaitError as e:
@@ -1180,14 +1420,32 @@ class InboxManager:
                     except Exception as e:
                         logger.error(f"❌ Scheduled backfill failed for {phone}: {e}")
 
+        # Profile photo sync every 10 minutes
+        async def photo_sync_task():
+            # Initial delay to let connections stabilize
+            await asyncio.sleep(60)
+            while self._running:
+                for phone in self._conn_manager.get_connected_accounts():
+                    try:
+                        count = await self._photo_syncer.sync_photos_for_account(phone)
+                        if count > 0:
+                            logger.info(f"📷 Fetched {count} profile photos for {phone}")
+                    except Exception as e:
+                        logger.error(f"❌ Scheduled photo sync failed for {phone}: {e}")
+                    await asyncio.sleep(2)  # Small delay between accounts
+                await asyncio.sleep(ProfilePhotoSyncer.SYNC_INTERVAL)
+                if not self._running:
+                    break
+
         # Create tasks
         self._scheduler_tasks = [
             asyncio.create_task(dialog_sync_task()),
             asyncio.create_task(full_sync_task()),
-            asyncio.create_task(backfill_task())
+            asyncio.create_task(backfill_task()),
+            asyncio.create_task(photo_sync_task())
         ]
 
-        logger.info("✅ Background scheduler started (dialog sync: 30min, full sync: 12h, backfill: 5min)")
+        logger.info("✅ Background scheduler started (dialog sync: 30min, full sync: 12h, backfill: 5min, photo sync: 10min)")
 
 
 # ============================================================================
@@ -1198,7 +1456,7 @@ __all__ = [
     'InboxManager',
     'EventProcessor',
     'SyncEngine',
-    'DMRateLimiter',
+    'ProfilePhotoSyncer',
     'SyncResult',
     'FullSyncResult',
     'ConnectionInfo'

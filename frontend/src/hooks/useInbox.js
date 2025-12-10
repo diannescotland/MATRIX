@@ -16,7 +16,8 @@ import {
   getInboxMessages,
   sendInboxMessage,
   getInboxRateLimitStatus,
-  triggerDialogSync
+  triggerDialogSync,
+  fetchInboxHistory
 } from '../services/api';
 
 const SOCKET_URL = 'http://localhost:5000';
@@ -266,6 +267,29 @@ export function useInbox(phone) {
       setError(null);
 
       try {
+        // Check if this conversation needs full history fetch
+        const conv = conversations.find((c) => c.peer_id === peerId);
+        if (conv && !conv.history_fetched) {
+          // Fetch full history first (one-time)
+          console.log('Fetching full history for', peerId);
+          try {
+            const historyResponse = await fetchInboxHistory(phone, peerId);
+            if (historyResponse.data?.success) {
+              console.log('Fetched', historyResponse.data.total_fetched, 'messages');
+              // Update conversation to mark history as fetched
+              setConversations((prev) =>
+                prev.map((c) =>
+                  c.peer_id === peerId ? { ...c, history_fetched: true } : c
+                )
+              );
+            }
+          } catch (historyErr) {
+            console.warn('Failed to fetch full history:', historyErr);
+            // Continue anyway - we'll show what we have
+          }
+        }
+
+        // Now fetch messages from DB
         const response = await getInboxMessages(phone, peerId, options);
         if (response.data.success) {
           setMessages(response.data.messages || []);
@@ -273,8 +297,8 @@ export function useInbox(phone) {
 
           // Reset unread count for this conversation
           setConversations((prev) =>
-            prev.map((conv) =>
-              conv.peer_id === peerId ? { ...conv, unread_count: 0 } : conv
+            prev.map((c) =>
+              c.peer_id === peerId ? { ...c, unread_count: 0 } : c
             )
           );
         } else {
@@ -287,7 +311,7 @@ export function useInbox(phone) {
         setLoadingMessages(false);
       }
     },
-    [phone]
+    [phone, conversations]
   );
 
   // Load more messages (pagination)

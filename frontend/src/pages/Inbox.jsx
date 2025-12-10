@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import {
@@ -76,8 +77,13 @@ function getInitials(firstName, lastName) {
   return (first + last).toUpperCase() || '?';
 }
 
-// Generate avatar URL using DiceBear
-function getAvatarUrl(peerId, name) {
+// Generate avatar URL - use real photo if available, fallback to DiceBear
+function getAvatarUrl(peerId, name, profilePhotoBase64 = null) {
+  // If we have a real profile photo, return as data URL
+  if (profilePhotoBase64) {
+    return `data:image/jpeg;base64,${profilePhotoBase64}`;
+  }
+  // Fallback to DiceBear generated avatar
   const seed = peerId || name || 'default';
   return `https://api.dicebear.com/9.x/initials/svg?seed=${seed}`;
 }
@@ -109,7 +115,7 @@ function StatusBadge({ status, className = '' }) {
   return (
     <span
       aria-label={statusType}
-      className={`inline-block size-3 rounded-full border-2 border-background ${STATUS_COLORS[statusType]} ${className}`}
+      className={`inline-block h-3 w-3 rounded-full border-2 border-background ${STATUS_COLORS[statusType]} ${className}`}
       title={statusType.charAt(0).toUpperCase() + statusType.slice(1)}
     />
   );
@@ -135,11 +141,11 @@ function MessageActions({ message, isOutgoing, onReply }) {
       <DropdownMenuTrigger asChild>
         <Button
           aria-label="Message actions"
-          className="size-7 rounded bg-background hover:bg-accent"
+          className="h-7 w-7 rounded bg-background hover:bg-accent"
           size="icon"
           variant="ghost"
         >
-          <MoreHorizontal className="size-3.5" />
+          <MoreHorizontal className="h-3.5 w-3.5" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="center" className="w-40 rounded-lg bg-popover p-1 shadow-xl">
@@ -150,7 +156,7 @@ function MessageActions({ message, isOutgoing, onReply }) {
             variant="ghost"
             onClick={() => onReply?.(message)}
           >
-            <Reply className="size-3" />
+            <Reply className="h-3 w-3" />
             <span>Reply</span>
           </Button>
           <Button
@@ -159,7 +165,7 @@ function MessageActions({ message, isOutgoing, onReply }) {
             variant="ghost"
             onClick={handleCopy}
           >
-            <Copy className="size-3" />
+            <Copy className="h-3 w-3" />
             <span>{copied ? 'Copied!' : 'Copy'}</span>
           </Button>
           {isOutgoing && (
@@ -168,7 +174,7 @@ function MessageActions({ message, isOutgoing, onReply }) {
               size="sm"
               variant="ghost"
             >
-              <Trash2 className="size-3" />
+              <Trash2 className="h-3 w-3" />
               <span>Delete</span>
             </Button>
           )}
@@ -177,7 +183,7 @@ function MessageActions({ message, isOutgoing, onReply }) {
             size="sm"
             variant="ghost"
           >
-            <Flag className="size-3" />
+            <Flag className="h-3 w-3" />
             <span>Report</span>
           </Button>
         </div>
@@ -200,7 +206,7 @@ function UserActionsMenu() {
           size="icon"
           variant="outline"
         >
-          <MoreVertical className="size-4" />
+          <MoreVertical className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent className="min-w-36 rounded-lg bg-popover p-1 shadow-xl">
@@ -210,7 +216,7 @@ function UserActionsMenu() {
             size="sm"
             variant="ghost"
           >
-            <UserMinus2 className="size-4" />
+            <UserMinus2 className="h-4 w-4" />
             <span className="font-medium text-xs">Block User</span>
           </Button>
           <Button
@@ -218,7 +224,7 @@ function UserActionsMenu() {
             size="sm"
             variant="ghost"
           >
-            <Trash2 className="size-4" />
+            <Trash2 className="h-4 w-4" />
             <span className="font-medium text-xs">Delete Conversation</span>
           </Button>
           <Button
@@ -226,7 +232,7 @@ function UserActionsMenu() {
             size="sm"
             variant="ghost"
           >
-            <Flag className="size-4" />
+            <Flag className="h-4 w-4" />
             <span className="font-medium text-xs">Report User</span>
           </Button>
         </div>
@@ -243,67 +249,109 @@ function ConversationItem({ conversation, isSelected, onClick, typingUsers, user
   const isTyping = typingUsers[conversation.peer_id];
   const status = userStatuses[conversation.peer_id];
   const unreadCount = conversation.unread_count || 0;
+  const incomingCount = conversation.incoming_count || 0;
+  const hasUnread = unreadCount > 0;
 
   return (
     <div
       onClick={onClick}
-      className={`flex items-center gap-3 p-3 cursor-pointer transition-all hover:bg-accent/50 border-l-2 ${
-        isSelected ? 'bg-accent border-l-primary' : 'border-l-transparent'
-      } ${unreadCount > 0 ? 'bg-primary/5' : ''}`}
+      className={cn(
+        // Base styles - card with clear borders
+        "flex items-center gap-3 p-3 mx-2 my-1.5 rounded-xl cursor-pointer transition-all duration-200",
+        "border-2 shadow-sm",
+        // Selected state
+        isSelected && "bg-primary/10 border-primary ring-2 ring-primary/20",
+        // Unread state - very prominent
+        hasUnread && !isSelected && "bg-blue-50 dark:bg-blue-950/50 border-blue-400 dark:border-blue-500 shadow-md shadow-blue-500/10",
+        // Read state - subtle
+        !hasUnread && !isSelected && "bg-card border-border/60 hover:border-border hover:bg-accent/30",
+        // Hover effect
+        "hover:shadow-md"
+      )}
     >
       {/* Avatar with status */}
       <div className="relative flex-shrink-0">
-        <Avatar className="size-12">
-          <AvatarImage 
-            src={getAvatarUrl(conversation.peer_id, conversation.first_name)} 
-            alt={conversation.first_name || 'User'} 
+        <Avatar className={cn(
+          "h-12 w-12 ring-2",
+          hasUnread ? "ring-blue-400 dark:ring-blue-500" : "ring-border/30"
+        )}>
+          <AvatarImage
+            src={getAvatarUrl(conversation.peer_id, conversation.first_name, conversation.profile_photo_base64)}
+            alt={conversation.first_name || 'User'}
           />
-          <AvatarFallback className="bg-primary/10 text-primary font-medium">
+          <AvatarFallback className={cn(
+            "font-semibold",
+            hasUnread ? "bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300" : "bg-muted text-muted-foreground"
+          )}>
             {getInitials(conversation.first_name, conversation.last_name)}
           </AvatarFallback>
         </Avatar>
-        <StatusBadge 
-          status={status} 
-          className="absolute bottom-0 right-0"
+        <StatusBadge
+          status={status}
+          className="absolute -bottom-0.5 -right-0.5 ring-2 ring-background"
         />
       </div>
 
       {/* Content */}
       <div className="flex-1 min-w-0">
+        {/* Top row: Name + message count + time */}
         <div className="flex items-center justify-between gap-2">
-          <span className={`font-medium truncate ${unreadCount > 0 ? 'text-foreground' : 'text-foreground/80'}`}>
-            {conversation.first_name} {conversation.last_name}
-          </span>
-          <span className="text-xs text-muted-foreground flex-shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className={cn(
+              "font-semibold truncate",
+              hasUnread ? "text-foreground" : "text-foreground/70"
+            )}>
+              {conversation.first_name} {conversation.last_name}
+            </span>
+            {/* Incoming message count badge */}
+            {incomingCount > 0 && (
+              <span className={cn(
+                "inline-flex items-center justify-center px-1.5 py-0.5 rounded-full text-[10px] font-bold",
+                hasUnread
+                  ? "bg-blue-200 dark:bg-blue-800 text-blue-800 dark:text-blue-200"
+                  : "bg-muted text-muted-foreground"
+              )}>
+                {incomingCount}
+              </span>
+            )}
+          </div>
+          <span className={cn(
+            "text-xs flex-shrink-0",
+            hasUnread ? "text-blue-600 dark:text-blue-400 font-medium" : "text-muted-foreground"
+          )}>
             {formatTime(conversation.last_msg_date)}
           </span>
         </div>
-        <div className="flex items-center justify-between gap-2 mt-0.5">
-          <span className={`text-sm truncate ${unreadCount > 0 ? 'text-foreground font-medium' : 'text-muted-foreground'}`}>
+
+        {/* Bottom row: Last message + unread badge */}
+        <div className="flex items-center justify-between gap-2 mt-1">
+          <span className={cn(
+            "text-sm truncate",
+            hasUnread ? "text-foreground font-medium" : "text-muted-foreground"
+          )}>
             {isTyping ? (
               <span className="text-primary italic flex items-center gap-1">
                 <span className="flex gap-0.5">
-                  <span className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                  <span className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                  <span className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                  <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
                 </span>
                 typing...
               </span>
             ) : conversation.last_msg_is_outgoing ? (
               <span className="flex items-center gap-1">
-                <CheckCheck className="size-3 text-muted-foreground" />
-                {conversation.last_msg_text || 'No messages'}
+                <CheckCheck className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                <span className="truncate">{conversation.last_msg_text || (conversation.last_msg_id ? '📷 Media' : 'Start a conversation')}</span>
               </span>
             ) : (
-              conversation.last_msg_text || 'No messages'
+              conversation.last_msg_text || (conversation.last_msg_id ? '📷 Media' : 'Start a conversation')
             )}
           </span>
-          {unreadCount > 0 && (
-            <Badge 
-              variant="default" 
-              className="h-5 min-w-[20px] flex items-center justify-center text-xs font-bold px-1.5 bg-primary"
-            >
-              +{unreadCount}
+
+          {/* Unread count badge - very prominent */}
+          {hasUnread && (
+            <Badge className="h-6 min-w-[24px] px-2 bg-blue-500 hover:bg-blue-600 text-white font-bold text-xs shadow-sm">
+              {unreadCount}
             </Badge>
           )}
         </div>
@@ -318,21 +366,24 @@ function ConversationItem({ conversation, isSelected, onClick, typingUsers, user
 
 function MessageBubble({ message, isOutgoing, peerInfo, onReply }) {
   return (
-    <div className={cn("group my-4 flex gap-2", isOutgoing ? "justify-end" : "justify-start")}>
-      <div className={cn("flex max-w-[80%] items-start gap-2", isOutgoing ? "flex-row-reverse" : undefined)}>
-        {/* Avatar on every message */}
-        <Avatar className="size-8">
+    <div className={cn("group my-3 flex gap-2.5", isOutgoing ? "justify-end" : "justify-start")}>
+      <div className={cn("flex max-w-[75%] items-end gap-2.5", isOutgoing ? "flex-row-reverse" : undefined)}>
+        {/* Avatar */}
+        <Avatar className={cn(
+          "h-9 w-9 ring-2 flex-shrink-0",
+          isOutgoing ? "ring-primary/30" : "ring-border/50"
+        )}>
           {isOutgoing ? (
-            <AvatarFallback className="bg-primary text-primary-foreground text-xs">
+            <AvatarFallback className="bg-primary text-primary-foreground text-xs font-semibold">
               You
             </AvatarFallback>
           ) : (
             <>
               <AvatarImage
-                src={getAvatarUrl(peerInfo?.peer_id, peerInfo?.first_name)}
+                src={getAvatarUrl(peerInfo?.peer_id, peerInfo?.first_name, peerInfo?.profile_photo_base64)}
                 alt={peerInfo?.first_name || 'User'}
               />
-              <AvatarFallback className="bg-accent text-xs">
+              <AvatarFallback className="bg-muted text-muted-foreground text-xs font-semibold">
                 {getInitials(peerInfo?.first_name, peerInfo?.last_name)}
               </AvatarFallback>
             </>
@@ -340,29 +391,42 @@ function MessageBubble({ message, isOutgoing, peerInfo, onReply }) {
         </Avatar>
 
         {/* Message content */}
-        <div>
+        <div className="flex flex-col">
           <div
             className={cn(
-              "rounded-md px-3 py-2 text-sm",
-              isOutgoing
-                ? "bg-primary text-primary-foreground"
-                : "bg-accent text-foreground"
+              // Base styles with border
+              "rounded-2xl px-4 py-2.5 text-sm shadow-sm border",
+              // Outgoing message - your messages (right side)
+              isOutgoing && [
+                "bg-primary text-primary-foreground",
+                "border-primary/50",
+                "rounded-br-md", // Sharp corner on bottom-right
+              ],
+              // Incoming message - their messages (left side)
+              !isOutgoing && [
+                "bg-card text-foreground",
+                "border-border",
+                "rounded-bl-md", // Sharp corner on bottom-left
+              ]
             )}
           >
-            <p className="whitespace-pre-wrap break-words">{message.text}</p>
+            <p className="whitespace-pre-wrap break-words leading-relaxed">{message.text}</p>
           </div>
 
           {/* Time, read status, and actions */}
-          <div className="mt-1 flex items-center gap-2">
-            <time className="text-muted-foreground text-xs">
+          <div className={cn(
+            "mt-1.5 flex items-center gap-2 px-1",
+            isOutgoing ? "justify-end" : "justify-start"
+          )}>
+            <time className="text-muted-foreground text-[11px]">
               {formatMessageTime(message.date)}
             </time>
             {isOutgoing && (
               <span className="text-muted-foreground">
                 {message.is_read ? (
-                  <CheckCheck className="size-3 text-primary" />
+                  <CheckCheck className="h-3.5 w-3.5 text-blue-500" />
                 ) : (
-                  <Check className="size-3" />
+                  <Check className="h-3.5 w-3.5" />
                 )}
               </span>
             )}
@@ -600,7 +664,7 @@ function Inbox() {
   const isAccountConnected = connectionStatus[selectedPhone]?.connected;
 
   return (
-    <div className="h-[calc(100vh-4rem)] flex flex-col bg-background">
+    <div className="h-[calc(100vh-4rem)] flex flex-col bg-background animate-fade-in">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b bg-card">
         <div className="flex items-center gap-4">
@@ -656,19 +720,19 @@ function Inbox() {
 
         {/* Account selector */}
         <div className="flex items-center gap-2">
-          <select
-            value={selectedPhone || ''}
-            onChange={(e) => handleAccountSelect(e.target.value)}
-            className="h-9 rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-          >
-            <option value="">Select account...</option>
-            {activeAccounts.map(account => (
-              <option key={account.phone} value={account.phone}>
-                {account.name || account.phone}
-                {connectionStatus[account.phone]?.connected ? ' ✓' : ''}
-              </option>
-            ))}
-          </select>
+          <Select value={selectedPhone || ''} onValueChange={handleAccountSelect}>
+            <SelectTrigger className="h-9 w-[200px]">
+              <SelectValue placeholder="Select account..." />
+            </SelectTrigger>
+            <SelectContent>
+              {activeAccounts.map(account => (
+                <SelectItem key={account.phone} value={account.phone}>
+                  {account.name || account.phone}
+                  {connectionStatus[account.phone]?.connected ? ' ✓' : ''}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
 
           <Button
             variant="outline"
@@ -732,7 +796,7 @@ function Inbox() {
                 </Button>
               </div>
             ) : (
-              <div className="divide-y">
+              <div className="py-1">
                 {filteredConversations.map(conv => (
                   <ConversationItem
                     key={conv.peer_id}
@@ -747,12 +811,6 @@ function Inbox() {
             )}
           </ScrollArea>
 
-          {/* Rate limit */}
-          {selectedPhone && isAccountConnected && (
-            <div className="p-3 border-t bg-muted/30">
-              <RateLimitIndicator status={rateLimitStatus} />
-            </div>
-          )}
         </div>
 
         {/* Messages panel */}
@@ -779,17 +837,17 @@ function Inbox() {
                 </Button>
 
                 <div className="relative">
-                  <Avatar className="size-10">
-                    <AvatarImage 
-                      src={getAvatarUrl(selectedConversation?.peer_id, selectedConversation?.first_name)} 
-                      alt={selectedConversation?.first_name || 'User'} 
+                  <Avatar className="h-10 w-10">
+                    <AvatarImage
+                      src={getAvatarUrl(selectedConversation?.peer_id, selectedConversation?.first_name, selectedConversation?.profile_photo_base64)}
+                      alt={selectedConversation?.first_name || 'User'}
                     />
                     <AvatarFallback>
                       {getInitials(selectedConversation?.first_name, selectedConversation?.last_name)}
                     </AvatarFallback>
                   </Avatar>
-                  <StatusBadge 
-                    status={userStatuses[selectedPeer]} 
+                  <StatusBadge
+                    status={userStatuses[selectedPeer]}
                     className="absolute bottom-0 right-0"
                   />
                 </div>

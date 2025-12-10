@@ -271,15 +271,7 @@ export default function Accounts() {
 
   return (
     <div className="p-6 space-y-6 animate-fade-in">
-      <div className="flex justify-between items-center">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
-            <Smartphone className="h-6 w-6 text-primary" />
-            Telegram Accounts
-          </h1>
-          <p className="text-muted-foreground mt-1">Manage your Telegram accounts and authentication</p>
-        </div>
-        <div className="flex gap-3">
+      <div className="flex justify-end items-center gap-3">
           <Button onClick={fetchAccounts} variant="outline" className="hover-scale">
             <RefreshCw className="h-4 w-4 mr-2" />
             Refresh
@@ -534,7 +526,6 @@ export default function Accounts() {
               </DialogFooter>
             </DialogContent>
           </Dialog>
-        </div>
       </div>
 
       <Card>

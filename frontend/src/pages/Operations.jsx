@@ -13,7 +13,7 @@ import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 // Select import removed - using MultiAccountSelector instead
-import { AlertCircle, Play, Square, RotateCcw, Download, User, Users, Clock } from 'lucide-react'
+import { AlertCircle, Play, Square, RotateCcw, Download, User, Users, Clock, Settings2, FileText, Search, FolderOpen, HardDrive } from 'lucide-react'
 
 function Operations({ isConnected }) {
   const [selectedOperation, setSelectedOperation] = useState('scan')
@@ -354,7 +354,7 @@ function Operations({ isConnected }) {
 
   if (!isConnected) {
     return (
-      <div className="p-5">
+      <div className="p-6">
         <Alert variant="destructive">
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>
@@ -366,12 +366,15 @@ function Operations({ isConnected }) {
   }
 
   return (
-    <div className="p-5">
+    <div className="p-6 animate-fade-in">
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Operation Selector */}
         <Card>
           <CardHeader>
-            <CardTitle>⚙️ Select Operation</CardTitle>
+            <CardTitle className="flex items-center gap-2">
+              <Settings2 className="h-5 w-5 text-primary" />
+              Select Operation
+            </CardTitle>
           </CardHeader>
           <CardContent>
             <RadioGroup value={selectedOperation} onValueChange={setSelectedOperation} disabled={isRunning}>
@@ -403,7 +406,10 @@ function Operations({ isConnected }) {
         <div className="lg:col-span-2">
           <Card>
             <CardHeader>
-              <CardTitle>📋 Operation Details</CardTitle>
+              <CardTitle className="flex items-center gap-2">
+              <FileText className="h-5 w-5 text-primary" />
+              Operation Details
+            </CardTitle>
             </CardHeader>
             <CardContent className="space-y-6">
               {currentOp && (
@@ -600,18 +606,18 @@ function Operations({ isConnected }) {
                       {/* Main Stats Grid */}
                       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                         {result.stats.replies_detected !== undefined && (
-                          <Card className="bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800">
+                          <Card className="stat-card-green border">
                             <CardContent className="pt-4 pb-3">
-                              <p className="text-xs font-semibold text-green-700 dark:text-green-300 uppercase">Replies Found</p>
-                              <p className="text-3xl font-bold text-green-600 dark:text-green-400">{result.stats.replies_detected}</p>
+                              <p className="text-xs font-semibold text-green-400 uppercase">Replies Found</p>
+                              <p className="text-3xl font-bold text-foreground">{result.stats.replies_detected}</p>
                             </CardContent>
                           </Card>
                         )}
                         {result.stats.updated !== undefined && (
-                          <Card className="bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800">
+                          <Card className="stat-card-blue border">
                             <CardContent className="pt-4 pb-3">
-                              <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase">Status Updated</p>
-                              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400">{result.stats.updated}</p>
+                              <p className="text-xs font-semibold text-blue-400 uppercase">Status Updated</p>
+                              <p className="text-3xl font-bold text-foreground">{result.stats.updated}</p>
                             </CardContent>
                           </Card>
                         )}
@@ -644,18 +650,18 @@ function Operations({ isConnected }) {
                           </CardHeader>
                           <CardContent>
                             <div className="grid grid-cols-2 gap-4">
-                              <div className="flex items-center gap-3 p-3 bg-purple-50 dark:bg-purple-950 rounded-lg">
+                              <div className="flex items-center gap-3 p-3 bg-purple-500/10 rounded-lg border border-purple-500/30">
                                 <div className="text-2xl">📢</div>
                                 <div>
                                   <p className="text-sm text-muted-foreground">KOLs Replied</p>
-                                  <p className="text-xl font-bold text-purple-600 dark:text-purple-400">{result.stats.kol_replied || 0}</p>
+                                  <p className="text-xl font-bold text-purple-400">{result.stats.kol_replied || 0}</p>
                                 </div>
                               </div>
-                              <div className="flex items-center gap-3 p-3 bg-orange-50 dark:bg-orange-950 rounded-lg">
+                              <div className="flex items-center gap-3 p-3 bg-orange-500/10 rounded-lg border border-orange-500/30">
                                 <div className="text-2xl">💻</div>
                                 <div>
                                   <p className="text-sm text-muted-foreground">Devs Replied</p>
-                                  <p className="text-xl font-bold text-orange-600 dark:text-orange-400">{result.stats.dev_replied || 0}</p>
+                                  <p className="text-xl font-bold text-orange-400">{result.stats.dev_replied || 0}</p>
                                 </div>
                               </div>
                             </div>
@@ -689,9 +695,9 @@ function Operations({ isConnected }) {
                                   key={idx}
                                   className={`flex items-center justify-between p-2 rounded-lg ${
                                     contact.type === 'kol'
-                                      ? 'bg-purple-50 dark:bg-purple-950/50'
+                                      ? 'bg-purple-500/10'
                                       : contact.type === 'dev'
-                                      ? 'bg-orange-50 dark:bg-orange-950/50'
+                                      ? 'bg-orange-500/10'
                                       : 'bg-muted/50'
                                   }`}
                                 >
@@ -710,9 +716,9 @@ function Operations({ isConnected }) {
                                     variant="outline"
                                     className={
                                       contact.type === 'kol'
-                                        ? 'text-purple-600 border-purple-300'
+                                        ? 'text-purple-400 border-purple-500/30'
                                         : contact.type === 'dev'
-                                        ? 'text-orange-600 border-orange-300'
+                                        ? 'text-orange-400 border-orange-500/30'
                                         : ''
                                     }
                                   >

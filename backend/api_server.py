@@ -6760,7 +6760,7 @@ def inbox_conversation_detail(phone, peer_id):
 def inbox_messages(phone, peer_id):
     """Get messages for conversation."""
     try:
-        limit = request.args.get('limit', 50, type=int)
+        limit = request.args.get('limit', 200, type=int)
         before_msg_id = request.args.get('before_msg_id', type=int)
 
         messages = inbox_get_messages(phone, peer_id, limit, before_msg_id)
@@ -6810,6 +6810,33 @@ def inbox_send_message(phone):
 
     except Exception as e:
         logger.error(f"❌ Error sending message: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# INBOX FETCH FULL HISTORY ENDPOINT
+# ============================================================================
+
+@app.route('/api/inbox/<phone>/conversations/<int:peer_id>/fetch-history', methods=['POST'])
+def inbox_fetch_full_history(phone, peer_id):
+    """Fetch complete message history for a conversation (on-demand)."""
+    global inbox_manager
+    try:
+        if not inbox_manager:
+            return jsonify({'error': 'Inbox manager not started'}), 503
+
+        result = run_inbox_coroutine(
+            inbox_manager.fetch_full_history(phone, peer_id)
+        )
+
+        if result.get('success'):
+            return jsonify(result)
+        else:
+            status = 429 if result.get('wait_seconds') else 400
+            return jsonify(result), status
+
+    except Exception as e:
+        logger.error(f"❌ Error fetching history: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 

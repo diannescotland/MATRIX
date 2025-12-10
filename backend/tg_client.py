@@ -98,10 +98,34 @@ class TGClient:
             if old_loop is not None and current_loop is not None and old_loop != current_loop:
                 # Loop changed - must create new instance to avoid Telethon error
                 logger.info(f"Event loop changed for {session_name}, creating fresh TGClient")
-                # Save session before discarding old instance
                 old_instance = cls._instances[instance_key]
-                if hasattr(old_instance, '_save_session'):
-                    old_instance._save_session()
+
+                # CRITICAL: Must disconnect and clean up old instance completely
+                # Otherwise Telethon throws "asyncio event loop must not change" error
+                try:
+                    # Save session first
+                    if hasattr(old_instance, '_save_session'):
+                        old_instance._save_session()
+
+                    # Disconnect the old client if connected
+                    if hasattr(old_instance, 'client') and old_instance.client:
+                        if old_instance.client.is_connected():
+                            # Can't await in __new__, so force disconnect synchronously
+                            # This is safe because we're abandoning this client anyway
+                            try:
+                                old_instance.client.disconnect()
+                            except Exception as e:
+                                logger.warning(f"Error disconnecting old client for {session_name}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error cleaning up old TGClient for {session_name}: {e}")
+
+                # Remove old instance from cache completely
+                del cls._instances[instance_key]
+                if instance_key in cls._instance_loops:
+                    del cls._instance_loops[instance_key]
+                if instance_key in cls._last_active:
+                    del cls._last_active[instance_key]
+
                 force_init = True
 
         # Return existing instance unless force_init

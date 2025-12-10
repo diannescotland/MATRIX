@@ -299,11 +299,21 @@ class GlobalConnectionManager:
 
         async with self._get_lock(clean_phone):
             try:
+                # Get connection info before cleanup (need api_id/api_hash for singleton removal)
+                conn_info = self._clients.get(clean_phone)
+
                 # Disconnect TGClient
                 if clean_phone in self._tg_clients:
                     tg_client = self._tg_clients[clean_phone]
                     await tg_client.disconnect(force=True, save_session=save_session)
                     del self._tg_clients[clean_phone]
+
+                    # CRITICAL: Also remove from TGClient singleton cache
+                    # This prevents stale instances from being reused in different event loops
+                    if conn_info:
+                        session_name = f"session_{clean_phone}"
+                        TGClient.remove_instance(session_name, conn_info.api_id, conn_info.api_hash)
+                        logger.debug(f"Removed TGClient singleton for {clean_phone}")
 
                 # Clean up connection info
                 if clean_phone in self._clients:
@@ -325,6 +335,13 @@ class GlobalConnectionManager:
                 # Still try to clean up
                 if clean_phone in self._tg_clients:
                     del self._tg_clients[clean_phone]
+                # Also clean up singleton cache on error
+                if conn_info:
+                    try:
+                        session_name = f"session_{clean_phone}"
+                        TGClient.remove_instance(session_name, conn_info.api_id, conn_info.api_hash)
+                    except Exception:
+                        pass
                 if clean_phone in self._clients:
                     del self._clients[clean_phone]
 
