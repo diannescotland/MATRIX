@@ -32,9 +32,15 @@ frontend/src/
 - TGClient auto-detects event loop changes and creates fresh instances
 
 **Key Classes:**
-- `TGClient` - Singleton wrapper with loop detection
+- `TGClient` - Singleton wrapper with loop detection + auto-cleanup
 - `GlobalConnectionManager` - Shared pool for all components
 - Both InboxManager and UnifiedContactManager share connections
+
+**Event Loop Handling (CRITICAL):**
+- Import operations run in **separate threads** with their own event loops
+- TGClient singleton detects loop changes and **auto-disconnects** old clients
+- GlobalConnectionManager **removes singleton cache** on disconnect
+- This prevents "asyncio event loop must not change" errors
 
 ---
 
@@ -155,6 +161,22 @@ taskkill /F /IM python.exe                 # Kill server (Windows)
 # Database
 sqlite3 data/matrix.db ".schema inbox_conversations"  # View schema
 ```
+
+## Troubleshooting
+
+**"asyncio event loop must not change" error:**
+- Cause: TGClient singleton was created in a different thread's event loop
+- Fix: Restart the backend server - singleton cache will be fresh
+- Prevention: Code now auto-cleans stale instances on loop change
+
+**Contact import shows 0% success rate:**
+- Check if account is connected in Inbox (may hold session lock)
+- Restart backend to release all connections
+- Verify session file exists: `sessions/session_{phone}.session`
+
+**Session expired / Auth key invalid:**
+- Delete session file: `del sessions\session_{phone}.session`
+- Re-authenticate via Accounts page
 
 ---
 
